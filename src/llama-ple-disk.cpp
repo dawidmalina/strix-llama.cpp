@@ -1,5 +1,6 @@
 #include "llama-ple-disk.h"
 
+#include "llama-bounded-file.h"
 #include "llama-impl.h"
 
 #include <algorithm>
@@ -9,6 +10,7 @@
 #include <cstdlib>
 #include <cstdio>
 #include <cstring>
+#include <exception>
 #include <mutex>
 #include <stdexcept>
 #include <thread>
@@ -24,15 +26,15 @@
 
 struct llama_ple_disk::impl {
     std::string fname;
-    int         fd     = -1;
     bool        direct = false;
     size_t      offs   = 0;
     ggml_type   type   = GGML_TYPE_COUNT;
     int64_t     ne0    = 0;
     int64_t     nrows  = 0;
     size_t      rs     = 0;     // bytes per row
-    size_t      block  = 4096;  // O_DIRECT alignment for offset, length and buffer
     ggml_to_float_t to_float = nullptr;
+    std::unique_ptr<llama_bounded_file> file;
+    int         fd     = -1;    // buffered-mode fd, used only for prefetch() fadvise hints
 
     // direct-mapped cache of raw rows: slot = row & mask, tag = row
     size_t               n_slots = 0;
@@ -47,7 +49,7 @@ struct llama_ple_disk::impl {
     std::vector<std::pair<int32_t, uint32_t>>  misses;   // (row, index into raw)
     float *                                    dst     = nullptr; // destination of the gather in progress
     const uint8_t *                            src_full = nullptr; // preloaded table while a gather reads from it
-    uint8_t *                                  bounce0 = nullptr; // calling-thread bounce buffer
+    llama_bounded_file::buffer                 bounce0;  // calling-thread bounce buffer
 
     std::mutex mtx; // one gather at a time; a model is shared by every context built on it
 
@@ -64,6 +66,7 @@ struct llama_ple_disk::impl {
     uint64_t                 gen     = 0;
     size_t                   pending = 0;
     std::atomic<size_t>      next{0};
+    std::exception_ptr       worker_error; // first error seen by a worker, rethrown on the calling thread
     bool                     stop    = false;
 
     // LLAMA_PLE_PRELOAD=1: the whole table is read once into anonymous (huge-page) RAM by background threads; once
@@ -82,6 +85,9 @@ struct llama_ple_disk::impl {
 #if defined(_WIN32)
         throw std::runtime_error("llama_ple_disk: not supported on Windows");
 #else
+        if (ne0 <= 0 || nrows <= 0) {
+            throw std::runtime_error("llama_ple_disk: invalid table shape");
+        }
         if (ggml_is_quantized(type) && ne0 % ggml_blck_size(type) != 0) {
             throw std::runtime_error(format("llama_ple_disk: row of %lld %s elements is not a whole number of blocks",
                                             (long long) ne0, ggml_type_name(type)));
@@ -94,35 +100,20 @@ struct llama_ple_disk::impl {
             }
         }
 
-        direct = p.direct_io;
-        if (direct) {
-            // only Linux has O_DIRECT; Darwin turns the page cache off per descriptor
-            // with F_NOCACHE after the open
-#if defined(O_DIRECT)
-            fd = open(fname.c_str(), O_RDONLY | O_DIRECT | O_CLOEXEC);
-#else
-            fd = open(fname.c_str(), O_RDONLY | O_CLOEXEC);
-#if defined(F_NOCACHE)
-            if (fd >= 0 && fcntl(fd, F_NOCACHE, 1) < 0) {
-                LLAMA_LOG_WARN("%s: F_NOCACHE on %s failed (%s); reads go through the page cache\n",
-                               __func__, fname.c_str(), strerror(errno));
-                direct = false;
-            }
-#else
-            direct = false;
-#endif
-#endif
-            if (fd < 0) {
-                LLAMA_LOG_WARN("%s: direct open of %s failed (%s); falling back to buffered reads\n",
-                               __func__, fname.c_str(), strerror(errno));
-                direct = false;
-            }
+        llama_bounded_file::params fp;
+        fp.direct_io = p.direct_io;
+        file   = std::make_unique<llama_bounded_file>(fname, fp);
+        direct = file->direct_io();
+        if (rs == 0 || (uint64_t) nrows > UINT64_MAX / rs) {
+            throw std::runtime_error("llama_ple_disk: table extent overflow");
         }
-        if (fd < 0) {
+        const uint64_t bytes = (uint64_t) nrows * rs;
+        if (offs > file->size() || bytes > file->size() - offs) {
+            throw std::runtime_error("llama_ple_disk: table extent is outside the file");
+        }
+        if (!direct) {
+            // best-effort fd used only to hint the page cache in prefetch(); failure is not fatal
             fd = open(fname.c_str(), O_RDONLY | O_CLOEXEC);
-            if (fd < 0) {
-                throw std::runtime_error(format("llama_ple_disk: failed to open %s: %s", fname.c_str(), strerror(errno)));
-            }
         }
 
         n_threads = std::max<int32_t>(1, p.n_threads);
@@ -162,7 +153,6 @@ struct llama_ple_disk::impl {
         for (auto & w : workers) {
             w.join();
         }
-        free(bounce0);
         if (fd >= 0) {
             close(fd);
         }
@@ -253,52 +243,9 @@ struct llama_ple_disk::impl {
         });
     }
 
-    size_t bounce_size() const {
-        return ((rs + block - 1) / block) * block + 2 * block;
-    }
-
-    uint8_t * alloc_bounce() const {
-        void * ptr = nullptr;
-        if (posix_memalign(&ptr, block, bounce_size()) != 0) {
-            throw std::runtime_error("llama_ple_disk: posix_memalign failed");
-        }
-        return (uint8_t *) ptr;
-    }
-
-    // read `len` bytes at `off` into `dst`; a short read is only tolerated past `need`
-    void pread_full(uint8_t * dst, size_t len, off_t off, size_t need) const {
-        size_t got = 0;
-        while (got < len) {
-            const ssize_t r = pread(fd, dst + got, len - got, off + (off_t) got);
-            if (r < 0) {
-                if (errno == EINTR) {
-                    continue;
-                }
-                GGML_ABORT("llama_ple_disk: pread(%s, %zu @ %lld) failed: %s",
-                           fname.c_str(), len, (long long) off, strerror(errno));
-            }
-            if (r == 0) {
-                break; // EOF
-            }
-            got += (size_t) r;
-        }
-        if (got < need) {
-            GGML_ABORT("llama_ple_disk: short read in %s: %zu of %zu bytes at %lld",
-                       fname.c_str(), got, need, (long long) off);
-        }
-    }
-
-    void read_row(int64_t row, uint8_t * dst, uint8_t * bounce) const {
-        const off_t off = (off_t) offs + (off_t) row * (off_t) rs;
-        if (!direct) {
-            pread_full(dst, rs, off, rs);
-            return;
-        }
-        const off_t  a0   = off & ~(off_t) (block - 1);
-        const size_t need = (size_t) (off - a0) + rs;
-        const size_t len  = ((need + block - 1) / block) * block;
-        pread_full(bounce, len, a0, need);
-        memcpy(dst, bounce + (off - a0), rs);
+    void read_row(int64_t row, uint8_t * dst, llama_bounded_file::buffer & bounce) const {
+        const uint64_t off = (uint64_t) offs + (uint64_t) row * rs;
+        file->read(off, dst, rs, bounce);
     }
 
     // dequantize distinct row u into the first position that asked for it, then copy it to the others
@@ -315,7 +262,7 @@ struct llama_ple_disk::impl {
         }
     }
 
-    void run_items(uint8_t * bounce) {
+    void run_items(llama_bounded_file::buffer & bounce) {
         for (;;) {
             const size_t i0 = next.fetch_add(grain);
             if (i0 >= n_items) {
@@ -333,8 +280,8 @@ struct llama_ple_disk::impl {
     }
 
     void worker() {
-        uint8_t * bounce = direct ? alloc_bounce() : nullptr;
-        uint64_t  seen   = 0;
+        llama_bounded_file::buffer bounce;
+        uint64_t                   seen = 0;
         for (;;) {
             {
                 std::unique_lock<std::mutex> lk(pm);
@@ -344,15 +291,25 @@ struct llama_ple_disk::impl {
                 }
                 seen = gen;
             }
-            run_items(bounce);
+            std::exception_ptr error;
+            try {
+                if (direct && bounce.empty()) {
+                    bounce = file->make_buffer(rs);
+                }
+                run_items(bounce);
+            } catch (...) {
+                error = std::current_exception();
+            }
             {
                 std::lock_guard<std::mutex> lk(pm);
+                if (error && !worker_error) {
+                    worker_error = error;
+                }
                 if (--pending == 0) {
                     cv_done.notify_one();
                 }
             }
         }
-        free(bounce);
     }
 
     // run `kind` over n items; up to serial_max of them stay on the calling thread,
@@ -361,8 +318,8 @@ struct llama_ple_disk::impl {
         job     = kind;
         n_items = n;
         grain   = g;
-        if (direct && bounce0 == nullptr) {
-            bounce0 = alloc_bounce();
+        if (direct && bounce0.empty()) {
+            bounce0 = file->make_buffer(rs);
         }
         if (n_threads <= 1 || n <= serial_max) {
             next = 0;
@@ -377,14 +334,29 @@ struct llama_ple_disk::impl {
         }
         {
             std::lock_guard<std::mutex> lk(pm);
-            next    = 0;
-            pending = workers.size();
+            next         = 0;
+            pending      = workers.size();
+            worker_error = nullptr;
             ++gen;
         }
         cv_work.notify_all();
-        run_items(bounce0);
+        // the calling thread also helps drain items, so its own read errors join the same
+        // worker_error slot instead of throwing early and abandoning still-running workers
+        std::exception_ptr error;
+        try {
+            run_items(bounce0);
+        } catch (...) {
+            error = std::current_exception();
+        }
         std::unique_lock<std::mutex> lk(pm);
         cv_done.wait(lk, [&] { return pending == 0; });
+        if (!error) {
+            error = worker_error;
+        }
+        lk.unlock();
+        if (error) {
+            std::rethrow_exception(error);
+        }
     }
 
     void gather(const int32_t * idx, size_t n, float * out) {
@@ -468,7 +440,9 @@ struct llama_ple_disk::impl {
         st_uniq  += n_uniq;
         st_hits  += n_uniq - misses.size();
         st_reads += misses.size();
-        st_bytes += misses.size() * (direct ? block : rs);
+        for (const auto & m : misses) {
+            st_bytes += file->read_size((uint64_t) offs + (uint64_t) m.first * rs, rs);
+        }
         st_ms    += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
     }
 #endif
