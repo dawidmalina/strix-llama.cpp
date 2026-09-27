@@ -208,11 +208,11 @@ __global__ __launch_bounds__(256) void qsa3_attn_kernel(
     NO_DEVICE_CODE;
 #else
     const int tid = threadIdx.x, lane = tid & 31, w = tid >> 5, r = lane & 15, hi = lane >> 4;
-    const int g = blockIdx.x, kvh = blockIdx.y;
-    __shared__ float4 part[3][8][64];
-    __shared__ uint4  ptile[3][32];
-    __shared__ float  alpha_s[48];
-    __shared__ float  l_s[48];
+    const int g = blockIdx.x >> 1, half = blockIdx.x & 1, kvh = blockIdx.y;
+    __shared__ float4 part[2][8][64];
+    __shared__ uint4  ptile[2][32];
+    __shared__ float  alpha_s[32];
+    __shared__ float  l_s[32];
 
     const size_t nblk = (size_t) s.nk / 4;
     const uint16_t * pkg = pk + (size_t) kvh * nblk * 1024;
@@ -221,17 +221,17 @@ __global__ __launch_bounds__(256) void qsa3_attn_kernel(
     const uint16_t * gmsk = umask + (size_t) g * s.cap;
     const int nchunks = ucount[g] >> 2;
 
-    v16s qf[3][2];
+    v16s qf[2][2];
     {
-        uint16_t * stage = reinterpret_cast<uint16_t *>(&part[0][0][0]) + w * (48 * 32);
+        uint16_t * stage = reinterpret_cast<uint16_t *>(&part[0][0][0]) + w * (32 * 32);
         const _Float16 hs = (_Float16) s.scale;
 #pragma unroll
-        for (int c = 0; c < 12; ++c) {
+        for (int c = 0; c < 8; ++c) {
             const int row = 4*c + (lane >> 3), dq = 4 * (lane & 7);
-            const int qi = row / 12, h = row - 12*qi;
+            const int original_row = 32*half + row, qi = original_row / 12, h = original_row - 12*qi;
             const int query = QSA3_G * g + qi;
             float4 v = make_float4(0.f, 0.f, 0.f, 0.f);
-            if (query < s.n_q) {
+            if (original_row < 48 && query < s.n_q) {
                 v = *reinterpret_cast<const float4 *>(reinterpret_cast<const char *>(q) + (size_t) query * s.q1 + (size_t) (kvh * s.gqa + h) * s.q2 + (size_t) (32*w + dq) * 4);
             }
             const uint16_t h0 = __builtin_bit_cast(uint16_t, (_Float16) v.x * hs), h1 = __builtin_bit_cast(uint16_t, (_Float16) v.y * hs);
@@ -240,7 +240,7 @@ __global__ __launch_bounds__(256) void qsa3_attn_kernel(
         }
         __syncthreads();
 #pragma unroll
-        for (int i = 0; i < 3; ++i)
+        for (int i = 0; i < 2; ++i)
 #pragma unroll
             for (int t = 0; t < 2; ++t) {
                 const uint16_t * src = stage + (16*i + r) * 32 + 16*t;
@@ -248,17 +248,17 @@ __global__ __launch_bounds__(256) void qsa3_attn_kernel(
             }
         __syncthreads();
     }
-    v8f O[3][2];
+    v8f O[2][2];
 #pragma unroll
-    for (int i = 0; i < 3; ++i)
+    for (int i = 0; i < 2; ++i)
 #pragma unroll
         for (int t = 0; t < 2; ++t)
 #pragma unroll
             for (int e = 0; e < 8; ++e) { O[i][t][e] = 0.f; }
     float m = -INFINITY, l = 0.f;
-    const int own_row = 16*w + r, own_qi = own_row / 12;
+    const int own_row = 32*half + 16*w + r, own_qi = own_row / 12;
     const int own_query = QSA3_G * g + own_qi;
-    const uint16_t * maskq = (mask && w < 3 && own_query < s.n_q)
+    const uint16_t * maskq = (mask && w < 2 && own_row < 48 && own_query < s.n_q)
         ? reinterpret_cast<const uint16_t *>(reinterpret_cast<const char *>(mask) + (size_t) own_query * s.m1) : nullptr;
 
     auto load_desc = [&](const int c, uint32_t & b01, uint32_t & b23, uint32_t & m01, uint32_t & m23) {
@@ -302,9 +302,9 @@ __global__ __launch_bounds__(256) void qsa3_attn_kernel(
     if (nchunks > 0) { load_desc(0, b01, b23, m01, m23); load_k(b01, b23, m01, m23, kf); }
 
     for (int c = 0; c < nchunks; ++c) {
-        v8f sc[3];
+        v8f sc[2];
 #pragma unroll
-        for (int i = 0; i < 3; ++i) {
+        for (int i = 0; i < 2; ++i) {
 #pragma unroll
             for (int e = 0; e < 8; ++e) { sc[i][e] = 0.f; }
 #pragma unroll
@@ -328,14 +328,14 @@ __global__ __launch_bounds__(256) void qsa3_attn_kernel(
         if (c + 1 < nchunks) { load_desc(c + 1, nb01, nb23, nm01, nm23); load_k(nb01, nb23, nm01, nm23, kfn); }
         else { kfn[0] = kf[0]; kfn[1] = kf[1]; }
 #pragma unroll
-        for (int i = 0; i < 3; ++i) {
+        for (int i = 0; i < 2; ++i) {
             if (i != w) {
                 part[i][w][lane*2+0] = make_float4(sc[i][0], sc[i][1], sc[i][2], sc[i][3]);
                 part[i][w][lane*2+1] = make_float4(sc[i][4], sc[i][5], sc[i][6], sc[i][7]);
             }
         }
         __syncthreads();
-        if (w < 3) {
+        if (w < 2) {
             float scf[8];
 #pragma unroll
             for (int e = 0; e < 8; ++e) { scf[e] = 0.f; }
@@ -388,23 +388,23 @@ __global__ __launch_bounds__(256) void qsa3_attn_kernel(
                                              (uint32_t) ph[4] | ((uint32_t) ph[5] << 16), (uint32_t) ph[6] | ((uint32_t) ph[7] << 16));
                 ptile[w][r*2+1] = make_uint4((uint32_t) ph[8] | ((uint32_t) ph[9] << 16), (uint32_t) ph[10] | ((uint32_t) ph[11] << 16),
                                              (uint32_t) ph[12] | ((uint32_t) ph[13] << 16), (uint32_t) ph[14] | ((uint32_t) ph[15] << 16));
-                alpha_s[own_row] = alpha;
+                alpha_s[16*w + r] = alpha;
             }
         }
         __syncthreads();
-        float al[3];
+        float al[2];
 #pragma unroll
-        for (int i = 0; i < 3; ++i) { al[i] = alpha_s[16*i + r]; }
-        if (__ballot(al[0] != 1.f || al[1] != 1.f || al[2] != 1.f)) {
+        for (int i = 0; i < 2; ++i) { al[i] = alpha_s[16*i + r]; }
+        if (__ballot(al[0] != 1.f || al[1] != 1.f)) {
 #pragma unroll
-            for (int i = 0; i < 3; ++i)
+            for (int i = 0; i < 2; ++i)
 #pragma unroll
                 for (int t = 0; t < 2; ++t)
 #pragma unroll
                     for (int e = 0; e < 8; ++e) { O[i][t][e] *= al[i]; }
         }
 #pragma unroll
-        for (int i = 0; i < 3; ++i) {
+        for (int i = 0; i < 2; ++i) {
             const v16s pf = __builtin_bit_cast(v16s, (uint4[2]){ptile[i][r*2+0], ptile[i][r*2+1]});
 #pragma unroll
             for (int t = 0; t < 2; ++t) { O[i][t] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(vf[t], pf, O[i][t]); }
@@ -413,11 +413,11 @@ __global__ __launch_bounds__(256) void qsa3_attn_kernel(
         b01 = nb01; b23 = nb23; m01 = nm01; m23 = nm23;
     }
 
-    if (w < 3 && hi == 0) { l_s[own_row] = l; }
+    if (w < 2 && hi == 0) { l_s[16*w + r] = l; }
     __syncthreads();
     float * ostage = reinterpret_cast<float *>(&part[0][0][0]) + w * (16 * 32);
 #pragma unroll
-    for (int i = 0; i < 3; ++i) {
+    for (int i = 0; i < 2; ++i) {
         const float li = l_s[16*i + r];
 #pragma unroll
         for (int t = 0; t < 2; ++t)
@@ -427,9 +427,9 @@ __global__ __launch_bounds__(256) void qsa3_attn_kernel(
 #pragma unroll
         for (int c = 0; c < 4; ++c) {
             const int rr = 4*c + (lane >> 3), dq = 4 * (lane & 7);
-            const int row = 16*i + rr, qi = row / 12, h = row - 12*qi;
+            const int original_row = 32*half + 16*i + rr, qi = original_row / 12, h = original_row - 12*qi;
             const int query = QSA3_G * g + qi;
-            if (query < s.n_q) {
+            if (original_row < 48 && query < s.n_q) {
                 float * dst = reinterpret_cast<float *>(reinterpret_cast<char *>(out) + (size_t) query * s.o2 + (size_t) (kvh * s.gqa + h) * s.o1) + 32*w + dq;
                 *reinterpret_cast<float4 *>(dst) = *reinterpret_cast<const float4 *>(ostage + rr * 32 + dq);
             }
@@ -510,7 +510,7 @@ void ggml_cuda_flash_attn_ext_qsa_prefill(ggml_backend_cuda_context & ctx, ggml_
         CUDA_CHECK(cudaGetLastError());
     }
     qsa3_layout layout{q->nb[1], q->nb[2], dst->nb[1], dst->nb[2], m ? m->nb[1] : 0, nk, n_q, 12, cap, scale};
-    const ggml_cuda_kernel_launch_params launch(dim3(ngroups, k->ne[2]), dim3(256), 0, ctx.stream());
+    const ggml_cuda_kernel_launch_params launch(dim3(2*ngroups, k->ne[2]), dim3(256), 0, ctx.stream());
     ggml_cuda_kernel_launch(qsa3_attn_kernel, launch, (const float *) q->data, packed_k.get(), packed_v.get(),
                             m ? (const uint16_t *) m->data : nullptr, (const uint16_t *) ublk.get(), (const uint16_t *) umask.get(),
                             (const int *) ucount.get(), (float *) dst->data, layout);
