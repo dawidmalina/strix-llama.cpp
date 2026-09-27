@@ -413,7 +413,7 @@ static __device__ __forceinline__ void hc_combine_norm_row_b256(
         float * out_res, float * out_xn, uint16_t * out_xn_bf16, const bool store_xn_f32,
         const uint16_t * res_in_bf16, uint16_t * res_out_bf16, const uint16_t * blk_in_bf16,
         const int n_embd, const float s1, const float b1, const float s2, const float b2, const float eps,
-        const float * w_inj, float * inj) {
+        const float * w_inj, float * inj, const float * cached_blk) {
     const int tid = threadIdx.x;
     const float x1 = s1 * inject[(int64_t) t * hc + c] + b1;
     const float x2 = hc_sigmoid(x1);
@@ -423,8 +423,8 @@ static __device__ __forceinline__ void hc_combine_norm_row_b256(
     const uint16_t * res16 = res_in_bf16  ? res_in_bf16  + row * n_embd : nullptr;
     float *          dst   = out_res      + row * n_embd;
     uint16_t *       dst16 = res_out_bf16 ? res_out_bf16 + row * n_embd : nullptr;
-    const float *    blk   = block_out + (int64_t) t * n_embd;
-    const uint16_t * blk16 = blk_in_bf16 ? blk_in_bf16 + (int64_t) t * n_embd : nullptr;
+    const float *    blk   = INJECT ? cached_blk : block_out + (int64_t) t * n_embd;
+    const uint16_t * blk16 = blk_in_bf16 ? (INJECT ? (const uint16_t *) cached_blk : blk_in_bf16 + (int64_t) t * n_embd) : nullptr;
     constexpr int KP = (HC_CN_MAX_EMB / 2 + HC_CN_BLOCK2 - 1) / HC_CN_BLOCK2;
     float xs[2 * KP];
     float tmp = 0.0f;
@@ -497,7 +497,7 @@ static __global__ void __launch_bounds__(HC_CN_BLOCK2, 4) hc_combine_norm_f32_b2
     __shared__ float s_sum[32];
     hc_combine_norm_row_b256<false>(blockIdx.x, blockIdx.y, gridDim.x, s_sum, inject, residual, block_out, gamma,
         out_res, out_xn, out_xn_bf16, store_xn_f32, res_in_bf16, res_out_bf16, blk_in_bf16,
-        n_embd, s1, b1, s2, b2, eps, nullptr, nullptr);
+        n_embd, s1, b1, s2, b2, eps, nullptr, nullptr, nullptr);
 }
 
 // One block per token over all HC_INJ_HC streams: the rows of hc_combine_norm_f32_b256 plus the next mix's inject projection.
@@ -510,13 +510,25 @@ static __global__ void __launch_bounds__(HC_CN_BLOCK2, 2) hc_combine_norm_inject
         const float * w_inj, float * out_inj) {
     __shared__ float s_sum[HC_INJ_HC][32];
     __shared__ float s_inj[HC_INJ_HC][HC_CN_BLOCK2 / WARP_SIZE];
+    __shared__ __align__(16) uint32_t s_blk[HC_CN_MAX_EMB];
     const int t = blockIdx.x;
+    // Cache the shared block output once per token; each of the four streams reads the same bytes.
+    for (int col = 2 * threadIdx.x; col < n_embd; col += 2 * HC_CN_BLOCK2) {
+        if (blk_in_bf16) {
+            if (col + 1 < n_embd) ((uint32_t *) s_blk)[col / 2] = *(const uint32_t *) (blk_in_bf16 + (int64_t) t * n_embd + col);
+            else ((uint16_t *) s_blk)[col] = blk_in_bf16[(int64_t) t * n_embd + col];
+        } else {
+            if (col + 1 < n_embd) *(uint2 *) (s_blk + col) = *(const uint2 *) (block_out + (int64_t) t * n_embd + col);
+            else s_blk[col] = __float_as_uint(block_out[(int64_t) t * n_embd + col]);
+        }
+    }
+    __syncthreads();
     float inj[HC_INJ_HC] = {};
 #pragma unroll
     for (int c = 0; c < HC_INJ_HC; ++c) {
         hc_combine_norm_row_b256<true>(c, t, HC_INJ_HC, s_sum[c], inject, residual, block_out, gamma,
             out_res, out_xn, out_xn_bf16, store_xn_f32, res_in_bf16, res_out_bf16, blk_in_bf16,
-            n_embd, s1, b1, s2, b2, eps, w_inj, inj);
+            n_embd, s1, b1, s2, b2, eps, w_inj, inj, (const float *) s_blk);
     }
     const int warp = threadIdx.x / WARP_SIZE, lane = threadIdx.x % WARP_SIZE;
 #pragma unroll
