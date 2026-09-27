@@ -302,13 +302,16 @@ __global__ __launch_bounds__(256) void qsa3_attn_kernel(
     if (nchunks > 0) { load_desc(0, b01, b23, m01, m23); load_k(b01, b23, m01, m23, kf); }
 
     for (int c = 0; c < nchunks; ++c) {
+        const uint32_t active = (m01 | (m01 >> 16) | m23 | (m23 >> 16)) & 0xffffu;
         v8f sc[3];
 #pragma unroll
         for (int i = 0; i < 3; ++i) {
 #pragma unroll
             for (int e = 0; e < 8; ++e) { sc[i][e] = 0.f; }
+            if (active & (0xffu << (4*i))) {
 #pragma unroll
-            for (int t = 0; t < 2; ++t) { sc[i] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(kf[t], qf[i][t], sc[i]); }
+                for (int t = 0; t < 2; ++t) { sc[i] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(kf[t], qf[i][t], sc[i]); }
+            }
         }
         v16s vf[2];
         {
