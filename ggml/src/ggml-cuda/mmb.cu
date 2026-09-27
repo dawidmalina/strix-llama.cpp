@@ -307,7 +307,6 @@ hc_gate_mix_kernel(const uint8_t * __restrict__ W, const uint16_t * __restrict__
     const int nks = K / MMB_BK;
     load_regs(0); store_lds(); __syncthreads();
     for (int ks = 0; ks < nks; ++ks) {
-        if (ks + 1 < nks) load_regs(ks + 1);
 #pragma unroll
         for (int kk = 0; kk < MMB_BK; kk += 16) {
             v16s a[HC], b[2]; const int r = lane & 15;
@@ -323,7 +322,10 @@ hc_gate_mix_kernel(const uint8_t * __restrict__ W, const uint16_t * __restrict__
                 for (int j = 0; j < 2; ++j) acc[c][j] = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(b[j], a[c], acc[c][j]);
         }
         __syncthreads();
-        if (ks + 1 < nks) store_lds();
+        if (ks + 1 < nks) {
+            load_regs(ks + 1);
+            store_lds();
+        }
         __syncthreads();
     }
     // epilogue: lane holds channel (lane & 15) of the wave's 16 and tokens 2e + (lane >> 4) of each 16-token fragment
