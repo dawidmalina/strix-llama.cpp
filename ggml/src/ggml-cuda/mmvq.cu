@@ -5,6 +5,8 @@
 #include "vecdotq.cuh"
 
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <type_traits>
 
 // only enabled on DGX Spark, where it is a gain on every type below. On the higher-bandwidth parts the kernel
@@ -1921,6 +1923,118 @@ static __global__ void mul_mat_vec_q_fq(
     GGML_UNUSED(stride_col_dst);
 }
 
+// Experiment: short-K Q8_0 matvec with several output rows per wave, so one wave keeps independent weight
+// streams in flight (the stock kernel exposes the full DRAM latency of a single ~340 B row). Each row is
+// still reduced by exactly one wave with the same lane->K mapping and the same per-lane accumulation order,
+// so the results are identical to mul_mat_vec_q_fq<Q8_0, false, nwarps, pf>. Plain path only (no fusion,
+// single channel/sample, y_op == 0), gated by MMVQ_FQ_RPW at launch.
+template <int rpw, int nwarps, int pf>
+__launch_bounds__(nwarps * ggml_cuda_get_physical_warp_size(), 1)
+static __global__ void mul_mat_vec_q_fq_q8_rows_nofuse(
+        const void * vx_ptr, const float * y_ptr, float * dst_ptr,
+        const uint32_t ncols_x, const uint32_t nrows_x,
+        const uint32_t stride_row_x, const uint32_t stride_channel_dst, const uint32_t stride_sample_dst,
+        const float y_scale, const float y_bias, const int y_op) {
+    constexpr int qk  = QK8_0;
+    constexpr int qi  = QI8_0;
+    constexpr int vdr = VDR_Q8_0_Q8_1_MMVQ;
+    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+    constexpr int blocks_per_iter = vdr * warp_size / qi;
+    constexpr int chunk_blocks = pf * blocks_per_iter;
+
+    extern __shared__ char mmvq_fq_smem[];
+    block_q8_1 * y_q8 = (block_q8_1 *) mmvq_fq_smem;
+
+    const int lane = threadIdx.x;
+    const int tid  = warp_size*threadIdx.y + lane;
+    const uint32_t row0 = blockIdx.x*nwarps + threadIdx.y;
+
+    const uint32_t blocks_per_row_x = ncols_x / qk;
+    const int kqs  = vdr * (lane % (qi/vdr));
+    const int kbx0 = lane / (qi/vdr);
+
+    {
+        const float * y = y_ptr;
+        const int nby = ncols_x / QK8_1;
+        for (int i = tid; i < 4*nby; i += nwarps*warp_size) {
+            const int ib  = i >> 2;
+            const int sub = i & 3;
+            const float4 * yv = (const float4 *) (y + ib*QK8_1 + sub*8);
+            const float4 v0 = yv[0];
+            const float4 v1 = yv[1];
+            float v[8] = {v0.x, v0.y, v0.z, v0.w, v1.x, v1.y, v1.z, v1.w};
+            if (y_op != 0) {
+                // fused activation prologue (scale -> unary), identical expressions/order to the stock kernel
+#pragma unroll
+                for (int k = 0; k < 8; ++k) {
+                    const float t = y_scale * v[k] + y_bias;
+                    v[k] = y_op == 1 ? ggml_cuda_op_silu_single(t) : 1.0f / (1.0f + expf(-t));
+                }
+            }
+            float amax = fabsf(v[0]);
+#pragma unroll
+            for (int k = 1; k < 8; ++k) {
+                amax = fmaxf(amax, fabsf(v[k]));
+            }
+            amax = fmaxf(amax, __shfl_xor_sync(0xffffffff, amax, 1, warp_size));
+            amax = fmaxf(amax, __shfl_xor_sync(0xffffffff, amax, 2, warp_size));
+            const float d = amax / 127.0f;
+            int q[8];
+#pragma unroll
+            for (int k = 0; k < 8; ++k) {
+                const int8_t qk8 = amax == 0.0f ? 0 : roundf(v[k] / d);
+                q[k] = (int) qk8 & 0xff;
+            }
+            int * qs = (int *) y_q8[ib].qs;
+            qs[2*sub + 0] = q[0] | (q[1] << 8) | (q[2] << 16) | (q[3] << 24);
+            qs[2*sub + 1] = q[4] | (q[5] << 8) | (q[6] << 16) | (q[7] << 24);
+            if (sub == 0) {
+                y_q8[ib].ds = make_half2(d, 0.0f);
+            }
+        }
+    }
+    __syncthreads();
+
+    const block_q8_0 * x[rpw];
+    mmvq_fq_q8_0_chunk<pf> cx[rpw];
+    float tmp[rpw];
+#pragma unroll
+    for (int r = 0; r < rpw; ++r) {
+        const uint32_t rr = row0*rpw + r;
+        const uint32_t rs = rr < nrows_x ? rr : nrows_x - 1;
+        x[r] = (const block_q8_0 *) vx_ptr + rs*stride_row_x;
+        tmp[r] = 0.0f;
+        mmvq_fq_q8_0_load(cx[r], x[r], kbx0, kqs, blocks_per_row_x);
+    }
+    for (int c0 = kbx0; c0 < blocks_per_row_x; c0 += chunk_blocks) {
+        mmvq_fq_q8_0_chunk<pf> nx[rpw];
+        const int c1 = c0 + chunk_blocks;
+        if (c1 < blocks_per_row_x) {
+#pragma unroll
+            for (int r = 0; r < rpw; ++r) {
+                mmvq_fq_q8_0_load(nx[r], x[r], c1, kqs, blocks_per_row_x);
+            }
+        }
+#pragma unroll
+        for (int r = 0; r < rpw; ++r) {
+            mmvq_fq_q8_0_dot(tmp[r], cx[r], y_q8, c0, kqs, blocks_per_row_x);
+        }
+        if (c1 < blocks_per_row_x) {
+#pragma unroll
+            for (int r = 0; r < rpw; ++r) {
+                cx[r] = nx[r];
+            }
+        }
+    }
+#pragma unroll
+    for (int r = 0; r < rpw; ++r) {
+        tmp[r] = warp_reduce_sum<warp_size>(tmp[r]);
+        if (lane == 0 && row0*rpw + r < nrows_x) {
+            dst_ptr[0*stride_sample_dst + 0*stride_channel_dst + row0*rpw + r] = tmp[r];
+        }
+    }
+}
+
 template <ggml_type type>
 static void mul_mat_vec_q_fq_launch(
         const void * vx, const float * y, const int32_t * ids, const ggml_cuda_mm_fusion_args_device & fusion, float * dst,
@@ -1945,6 +2059,13 @@ static void mul_mat_vec_q_fq_launch(
     while (nwarps > 4 && ((nrows_x + nwarps - 1) / nwarps) * nchannels_dst * nsamples_dst < 2 * nsm) {
         nwarps /= 2;
     }
+    // Experiment-only geometry override (byte-exact: one wave still reduces one full row, so the per-lane
+    // accumulation order is unchanged). MMVQ_FQ_NW=4|8|16 forces the waves per block.
+    if (const int e = getenv("MMVQ_FQ_NW") ? atoi(getenv("MMVQ_FQ_NW")) : 0) {
+        if (e == 4 || e == 8 || e == 16) {
+            nwarps = e;
+        }
+    }
 
     const dim3 block_nums((nrows_x + nwarps - 1) / nwarps, nchannels_dst, nsamples_dst);
     const dim3 block_dims(warp_size, nwarps, 1);
@@ -1962,13 +2083,44 @@ static void mul_mat_vec_q_fq_launch(
 
     // deeper weight prefetch for long rows when the grid is too small to hide DRAM latency with many waves
     constexpr int blocks_per_iter = VDR_Q8_0_Q8_1_MMVQ * 32 / QI8_0;
-    const bool long_rows = type == GGML_TYPE_Q8_0 && (ncols_x / QK8_0) >= 16 * blocks_per_iter &&
+    bool long_rows = type == GGML_TYPE_Q8_0 && (ncols_x / QK8_0) >= 16 * blocks_per_iter &&
         (int64_t) nrows_x * nchannels_dst * nsamples_dst <= 1024;
+    // Experiment-only: MMVQ_FQ_PFLONG=1 forces the deep prefetch path even when the short-K heuristic says no.
+    if (getenv("MMVQ_FQ_PFLONG") && atoi(getenv("MMVQ_FQ_PFLONG")) != 0) {
+        long_rows = true;
+    }
+
+    // Experiment-only: MMVQ_FQ_RPW=2|4|8 puts that many output rows per wave for short-K Q8_0 (byte-exact:
+    // one wave still reduces each full row with the unchanged per-lane order).
+    // Short-K Q8_0 single-row matvecs (e.g. the [320 -> 10240] hyper-connection up projections of qwen4exp)
+    // expose the full DRAM latency of one ~340 B row per wave. Put MMVQ_FQ_RPW rows per wave so a wave keeps
+    // several independent weight streams in flight. Byte-exact: one wave still reduces each full row with the
+    // unchanged lane->K mapping and per-lane order (verified against the saved-logits hash). Default 2 for the
+    // short-K shape; MMVQ_FQ_RPW overrides (1 disables), MMVQ_FQ_NW / MMVQ_FQ_PFLONG remain experiment knobs.
+    const int rpw_env = getenv("MMVQ_FQ_RPW") ? atoi(getenv("MMVQ_FQ_RPW")) : -1;
+    const bool short_k_q8 = type == GGML_TYPE_Q8_0 && !has_fusion && ids == nullptr && y_op != 3 &&
+        nchannels_dst == 1 && nsamples_dst == 1 && ncols_x <= 512;
+    const int rpw = rpw_env >= 1 ? rpw_env : (short_k_q8 ? 2 : 1);
+    if (rpw > 1 && short_k_q8) {
+        const dim3 rblock_nums((nrows_x + nwarps*rpw - 1)/(nwarps*rpw), 1, 1);
+        const dim3 rblock_dims(warp_size, nwarps, 1);
+        const ggml_cuda_kernel_launch_params rlaunch_params = ggml_cuda_kernel_launch_params(rblock_nums, rblock_dims, nbytes_shared, stream);
+        if (nwarps == 16 && rpw == 2) { ggml_cuda_kernel_launch(mul_mat_vec_q_fq_q8_rows_nofuse<2,16,MMVQ_FQ_PF>, rlaunch_params, vx, y, dst, ncols_x, nrows_x, stride_row_x, stride_channel_dst, stride_sample_dst, y_scale, y_bias, y_op); return; }
+        if (nwarps == 16 && rpw == 4) { ggml_cuda_kernel_launch(mul_mat_vec_q_fq_q8_rows_nofuse<4,16,MMVQ_FQ_PF>, rlaunch_params, vx, y, dst, ncols_x, nrows_x, stride_row_x, stride_channel_dst, stride_sample_dst, y_scale, y_bias, y_op); return; }
+        if (nwarps == 16 && rpw == 8) { ggml_cuda_kernel_launch(mul_mat_vec_q_fq_q8_rows_nofuse<8,16,MMVQ_FQ_PF>, rlaunch_params, vx, y, dst, ncols_x, nrows_x, stride_row_x, stride_channel_dst, stride_sample_dst, y_scale, y_bias, y_op); return; }
+        if (nwarps == 8  && rpw == 2) { ggml_cuda_kernel_launch(mul_mat_vec_q_fq_q8_rows_nofuse<2,8,MMVQ_FQ_PF>, rlaunch_params, vx, y, dst, ncols_x, nrows_x, stride_row_x, stride_channel_dst, stride_sample_dst, y_scale, y_bias, y_op); return; }
+        if (nwarps == 8  && rpw == 4) { ggml_cuda_kernel_launch(mul_mat_vec_q_fq_q8_rows_nofuse<4,8,MMVQ_FQ_PF>, rlaunch_params, vx, y, dst, ncols_x, nrows_x, stride_row_x, stride_channel_dst, stride_sample_dst, y_scale, y_bias, y_op); return; }
+    }
 
     switch (nwarps) {
         case 16:
-            if (has_fusion) { launch(mul_mat_vec_q_fq<type, true,  16, MMVQ_FQ_PF>); }
-            else            { launch(mul_mat_vec_q_fq<type, false, 16, MMVQ_FQ_PF>); }
+            if (long_rows) {
+                if (has_fusion) { launch(mul_mat_vec_q_fq<type, true,  16, MMVQ_FQ_PF_LONG>); }
+                else            { launch(mul_mat_vec_q_fq<type, false, 16, MMVQ_FQ_PF_LONG>); }
+            } else {
+                if (has_fusion) { launch(mul_mat_vec_q_fq<type, true,  16, MMVQ_FQ_PF>); }
+                else            { launch(mul_mat_vec_q_fq<type, false, 16, MMVQ_FQ_PF>); }
+            }
             break;
         case 8:
             if (long_rows) {
