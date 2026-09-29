@@ -2085,6 +2085,13 @@ static void mul_mat_vec_q_fq_launch(
     constexpr int blocks_per_iter = VDR_Q8_0_Q8_1_MMVQ * 32 / QI8_0;
     bool long_rows = type == GGML_TYPE_Q8_0 && (ncols_x / QK8_0) >= 16 * blocks_per_iter &&
         (int64_t) nrows_x * nchannels_dst * nsamples_dst <= 1024;
+    // Long-K Q8_0 shapes with no fusion and a large grid also run at the DRAM latency floor: give them the
+    // deeper prefetch too. Only the load distance changes (the per-lane accumulation order is unchanged), so
+    // the results stay byte-exact. ncols < 640 and fused shapes are untouched (hc_up keeps its rows-per-wave).
+    if (type == GGML_TYPE_Q8_0 && !has_fusion && (ncols_x / QK8_0) >= 20 &&
+            (int64_t) nrows_x * nchannels_dst * nsamples_dst > 1024) {
+        long_rows = true;
+    }
     // Experiment-only: MMVQ_FQ_PFLONG=1 forces the deep prefetch path even when the short-K heuristic says no.
     if (getenv("MMVQ_FQ_PFLONG") && atoi(getenv("MMVQ_FQ_PFLONG")) != 0) {
         long_rows = true;
