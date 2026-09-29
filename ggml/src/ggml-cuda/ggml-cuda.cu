@@ -4604,6 +4604,22 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         }
     }
 
+    // one-token Q8_0 matvec (fused-quantize path) whose activations a later non-Q8_0 MoE matvec reads too (qwen4exp:
+    // shared-expert gate+up, then the Q4_K routed gate+up): the first launch stores its Q8_1 copy for the second
+    if (node->op == GGML_OP_MUL_MAT && GGML_CUDA_CC_IS_RDNA3_5(ggml_cuda_info().devices[cuda_ctx->device].cc) &&
+            node->src[0]->type == GGML_TYPE_Q8_0 && node->src[1]->type == GGML_TYPE_F32 && ggml_nrows(node->src[1]) == 1 &&
+            getenv("GGML_CUDA_DISABLE_Q8X") == nullptr) {
+        for (int j = i + 1; j < cgraph->n_nodes && j <= i + 32; ++j) {
+            const ggml_tensor * n = cgraph->nodes[j];
+            if (n->op == GGML_OP_MUL_MAT_ID && n->src[1] && n->src[1]->data == node->src[1]->data &&
+                    ggml_nelements(n->src[1]) == ggml_nelements(node->src[1]) &&
+                    (n->src[0]->type == GGML_TYPE_Q4_K || n->src[0]->type == GGML_TYPE_Q5_K)) {
+                ggml_cuda_mmvq_q8x_request(node->src[1], n);
+                break;
+            }
+        }
+    }
+
     // one-token F32 matvec with few rows (qwen4exp hc_*_inject [10240 x 4]) followed by a Q8_0 matvec of the same
     // activations (hc_*_down): the F32 rows ride along as extra blocks of the fused-quantize Q8_0 launch
     if (node->op == GGML_OP_MUL_MAT && GGML_CUDA_CC_IS_RDNA3_5(ggml_cuda_info().devices[cuda_ctx->device].cc) &&
@@ -6628,6 +6644,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 stream_ctx.concurrent_events.clear();
             }
 
+            ggml_cuda_mmvq_q8x_reset();
             bool has_deferred = ggml_cuda_deferred_prepare(cgraph);
             for (int i = 0; i < cgraph->n_nodes; i++) {
                 ggml_tensor * node = cgraph->nodes[i];

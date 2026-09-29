@@ -1642,6 +1642,8 @@ struct ggml_cuda_mm_fusion_args_device {
     int           aux_nseg      = 0;
     int           aux_ncols2    = 0;
     int           aux_blocks    = 0;
+    // RDNA3.5 fused-quantize matvec: block 0 also stores its quantize_q8_1-exact Q8_1 activations (with block sums)
+    void *        y_q8_out      = nullptr;
 };
 
 struct ggml_cuda_kernel_launch_params {

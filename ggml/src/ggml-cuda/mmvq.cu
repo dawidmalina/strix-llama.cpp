@@ -2122,6 +2122,9 @@ static __global__ void mul_mat_vec_q_fq(
             amax = fmaxf(amax, __shfl_xor_sync(0xffffffff, amax, 2, warp_size));
 
             const float sum = mmvq_fq_needs_sum(type) ? mmvq_fq_block_sum(v, warp_size) : 0.0f;
+            // only the gated (shared-expert gate+up) instantiations export; the others keep their code unchanged
+            const bool q8x = has_fusion && fusion.y_q8_out != nullptr && blockIdx.x == 0 && blockIdx.y == 0 && blockIdx.z == 0;
+            const float sum_x = q8x ? (mmvq_fq_needs_sum(type) ? sum : mmvq_fq_block_sum(v, warp_size)) : 0.0f;
 
             const float d = amax / 127.0f;
             int q[8];
@@ -2135,6 +2138,15 @@ static __global__ void mul_mat_vec_q_fq(
             qs[2*sub + 1] = q[4] | (q[5] << 8) | (q[6] << 16) | (q[7] << 24);
             if (sub == 0) {
                 y_q8[ib].ds = make_half2(d, sum);
+            }
+            if (has_fusion && q8x) {
+                block_q8_1 * yo = (block_q8_1 *) fusion.y_q8_out;
+                int * qso = (int *) yo[ib].qs;
+                qso[2*sub + 0] = qs[2*sub + 0];
+                qso[2*sub + 1] = qs[2*sub + 1];
+                if (sub == 0) {
+                    yo[ib].ds = make_half2(d, sum_x);
+                }
             }
         }
     }
@@ -2356,6 +2368,45 @@ static __global__ void mul_mat_vec_q_fq_q8_rows_nofuse(
             dst_ptr[0*stride_sample_dst + 0*stride_channel_dst + row0*rpw + r] = tmp[r];
         }
     }
+}
+
+// Q8_1 export: the next fused-quantize launch over the requested activations also stores their Q8_1 copy, which
+// the requested (non-fused-quantize) matvec then uses instead of running quantize_q8_1 (qwen4exp: the shared-expert
+// gate+up quantizes the MoE input, the routed Q4_K gate+up reads it).
+struct mmvq_q8x_state {
+    const ggml_tensor * y      = nullptr; // requested activations
+    const ggml_tensor * target = nullptr; // the matvec allowed to consume the copy (its src1 must be y)
+    bool                ready  = false;
+    int                 device = -1;
+    void *              buf    = nullptr;
+    size_t              size   = 0;
+};
+static mmvq_q8x_state g_mmvq_q8x;
+
+void ggml_cuda_mmvq_q8x_request(const ggml_tensor * y, const ggml_tensor * target) {
+    g_mmvq_q8x.y      = y;
+    g_mmvq_q8x.target = target;
+    g_mmvq_q8x.ready  = false;
+}
+
+void ggml_cuda_mmvq_q8x_reset() {
+    g_mmvq_q8x.y      = nullptr;
+    g_mmvq_q8x.target = nullptr;
+    g_mmvq_q8x.ready  = false;
+}
+
+static void * mmvq_q8x_buffer(size_t size) {
+    const int device = ggml_cuda_get_device();
+    if (g_mmvq_q8x.buf == nullptr || g_mmvq_q8x.size < size || g_mmvq_q8x.device != device) {
+        // persistent, never freed while the process runs; small (one activation vector in Q8_1)
+        size = std::max<size_t>(size, 64*1024);
+        void * p = nullptr;
+        CUDA_CHECK(cudaMalloc(&p, size));
+        g_mmvq_q8x.buf    = p;
+        g_mmvq_q8x.size   = size;
+        g_mmvq_q8x.device = device;
+    }
+    return g_mmvq_q8x.buf;
 }
 
 struct mmvq_fq_aux_pending {
@@ -3601,6 +3652,13 @@ static bool mul_mat_vec_q_fq_try(
         fusion_local.y_norm_w  = fusion->y_norm_w ? fusion->y_norm_w->data : nullptr;
         fusion_local.y_eps     = fusion->y_eps;
     }
+    if (g_mmvq_q8x.y != nullptr && !g_mmvq_q8x.ready && g_mmvq_q8x.y->data == src1->data && y_op == 0 && ids == nullptr &&
+            fusion && fusion->gate &&
+            ggml_nelements(src1) == ne10 && ne10 % QK8_1 == 0 && ggml_is_contiguous(src1) &&
+            GGML_PAD(ne10, MATRIX_ROW_PADDING) == ne10) {
+        fusion_local.y_q8_out = mmvq_q8x_buffer((ne10 / QK8_1) * sizeof(block_q8_1));
+        g_mmvq_q8x.ready = true;
+    }
 
     // If src0 is a temporary compute buffer, clear any potential padding.
     if (ggml_backend_buffer_get_usage(src0->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE) {
@@ -4116,8 +4174,14 @@ void ggml_cuda_mul_mat_vec_q(
     }
 
     const int64_t ne10_padded = GGML_PAD(ne10, MATRIX_ROW_PADDING);
+    const bool q8x_use = g_mmvq_q8x.ready && g_mmvq_q8x.target != nullptr && g_mmvq_q8x.y->data == src1->data &&
+        (dst == g_mmvq_q8x.target || (fusion && fusion->gate && (g_mmvq_q8x.target->src[0] == src0 || g_mmvq_q8x.target->src[0] == fusion->gate))) &&
+        ggml_nelements(src1) == ne10 && ne10_padded == ne10;
     ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool(), ne13*ne12 * ne11*ne10_padded * sizeof(block_q8_1)/QK8_1);
-    {
+    const void * src1_q8_ptr = q8x_use ? g_mmvq_q8x.buf : (const void *) src1_q8_1.get();
+    if (q8x_use) {
+        ggml_cuda_mmvq_q8x_reset();
+    } else {
         const int64_t s11 = src1->nb[1] / ts_src1;
         const int64_t s12 = src1->nb[2] / ts_src1;
         const int64_t s13 = src1->nb[3] / ts_src1;
@@ -4147,7 +4211,7 @@ void ggml_cuda_mul_mat_vec_q(
     const int64_t ids_stride = ids ? ids->nb[1] / ggml_type_size(ids->type) : 0;
 
     mul_mat_vec_q_switch_type(
-        src0->data, src0->type, src1_q8_1.get(), ids_d, fusion_local, dst_d, ne00,
+        src0->data, src0->type, src1_q8_ptr, ids_d, fusion_local, dst_d, ne00,
         ne01,              ncols_dst,     s01, stride_col_y,     stride_col_dst,
         ne02, nchannels_y, nchannels_dst, s02, stride_channel_y, stride_channel_dst,
         ne03,              ne3,           s03, s13,              s3,               ids_stride, stream);

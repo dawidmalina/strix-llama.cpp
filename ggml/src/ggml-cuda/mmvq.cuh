@@ -58,3 +58,7 @@ bool ggml_cuda_mul_mat_vec_q_fq_hcmix_ok(ggml_backend_cuda_context & ctx, const 
         const ggml_tensor * xn, const ggml_tensor * dst, int hc);
 void ggml_cuda_mul_mat_vec_q_fq_hcmix(ggml_backend_cuda_context & ctx, const ggml_tensor * mm, const ggml_tensor * y,
         float y_scale, float y_bias, int y_op, const ggml_tensor * xn, ggml_tensor * dst, float mix_scale, float mix_bias);
+
+// RDNA3.5: let the next fused-quantize matvec over y store its Q8_1 activations for `target` (a later matvec of y)
+void ggml_cuda_mmvq_q8x_request(const ggml_tensor * y, const ggml_tensor * target);
+void ggml_cuda_mmvq_q8x_reset();
