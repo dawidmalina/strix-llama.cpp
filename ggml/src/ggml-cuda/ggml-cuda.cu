@@ -808,8 +808,14 @@ static void ggml_backend_cuda_buffer_memset_tensor(ggml_backend_buffer_t buffer,
     CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
 }
 
+static bool ggml_cuda_deferred_intercept(ggml_tensor * tensor, const void * data, size_t offset, size_t size);
+
 static void ggml_backend_cuda_buffer_set_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *) buffer->context;
+
+    if (ggml_cuda_deferred_intercept(tensor, data, offset, size)) {
+        return;
+    }
 
     ggml_cuda_set_device(ctx->device);
     CUDA_CHECK(cudaMemcpyAsync((char *) tensor->data + offset, data, size, cudaMemcpyHostToDevice, cudaStreamPerThread));
@@ -6237,6 +6243,7 @@ struct ggml_cuda_deferred_input {
     ggml_cuda_deferred_input_wait_t wait;
     void *                          user_data;
     int                             flush_at; // node index at which the upload is enqueued
+    ggml_tensor *                   dev_copy; // device copy the scheduler made of a host-buffer input, if any
 };
 
 static std::mutex                            ggml_cuda_deferred_mutex;
@@ -6251,8 +6258,23 @@ static bool ggml_backend_cuda_defer_input(ggml_tensor * tensor, ggml_cuda_deferr
         return false;
     }
     std::lock_guard<std::mutex> lock(ggml_cuda_deferred_mutex);
-    ggml_cuda_deferred_inputs.push_back({ tensor, wait, user_data, 0 });
+    ggml_cuda_deferred_inputs.push_back({ tensor, wait, user_data, 0, nullptr });
     return true;
+}
+
+// The scheduler copies a host-buffer input into the split's device copy with a synchronous set_tensor before the
+// graph runs. For a deferred input that copy would read data that is not there yet: remember the device copy
+// instead and upload into it when the input becomes due.
+static bool ggml_cuda_deferred_intercept(ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
+    std::lock_guard<std::mutex> lock(ggml_cuda_deferred_mutex);
+    for (auto & d : ggml_cuda_deferred_inputs) {
+        if (d.dev_copy == nullptr && d.tensor != tensor && data == d.tensor->data && offset == 0 &&
+                size == ggml_nbytes(d.tensor) && ggml_nbytes(tensor) == size && ggml_is_contiguous(tensor)) {
+            d.dev_copy = tensor;
+            return true;
+        }
+    }
+    return false;
 }
 
 static bool ggml_cuda_deferred_pending() {
@@ -6276,6 +6298,15 @@ static bool ggml_cuda_tensor_reads(const ggml_tensor * node, const ggml_tensor *
 static void ggml_cuda_deferred_upload(ggml_backend_cuda_context * cuda_ctx, const ggml_cuda_deferred_input & d) {
     const void * data = d.wait(d.user_data);
     GGML_ASSERT(data != nullptr);
+    if (d.dev_copy != nullptr) {
+        // host input with a device copy: fill the input (as set_input would have), then the copy (as the scheduler would have)
+        if (d.tensor->data != data) {
+            memcpy(d.tensor->data, data, ggml_nbytes(d.tensor));
+        }
+        ggml_cuda_set_device(cuda_ctx->device);
+        CUDA_CHECK(cudaMemcpyAsync(d.dev_copy->data, d.tensor->data, ggml_nbytes(d.tensor), cudaMemcpyHostToDevice, cuda_ctx->stream()));
+        return;
+    }
     if (ggml_backend_buft_is_cuda_host(d.tensor->buffer->buft)) {
         // no kernel reading the tensor has been enqueued yet, and the previous graph finished before its inputs
         // were set, so the host can write it in place; the next launch orders the write before the reader
@@ -6296,8 +6327,9 @@ static bool ggml_cuda_deferred_prepare(ggml_cgraph * cgraph) {
     constexpr int lookahead = 24;
     for (auto & d : ggml_cuda_deferred_inputs) {
         int first = cgraph->n_nodes;
+        const ggml_tensor * t = d.dev_copy ? d.dev_copy : d.tensor;
         for (int k = 0; k < cgraph->n_nodes; ++k) {
-            if (ggml_cuda_tensor_reads(cgraph->nodes[k], d.tensor)) {
+            if (ggml_cuda_tensor_reads(cgraph->nodes[k], t)) {
                 first = k;
                 break;
             }
