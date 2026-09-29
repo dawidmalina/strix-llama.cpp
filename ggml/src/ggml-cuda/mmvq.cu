@@ -2428,13 +2428,25 @@ void ggml_cuda_mmv_group(ggml_backend_cuda_context & ctx, const ggml_tensor * y,
 
     constexpr int blocks_per_iter = VDR_Q8_0_Q8_1_MMVQ * 32 / QI8_0;
     const bool long_rows = (ncols / QK8_0) >= 16 * blocks_per_iter && total_q8_rows <= 1024;
+    // Deep-prefetch path for long-K grouped matvecs (e.g. attn_qkv + attn_gate, K=2560): only the load
+    // distance changes, so the per-lane accumulation order (and the results) stay identical.
+    const bool deep = (ncols / QK8_0) >= 20;
+    // Experiment knob: MMVQ_FQ_GROUPPF=4 uses pf=4 instead of the default pf=8 on the deep path.
+    const int gpf_env = getenv("MMVQ_FQ_GROUPPF") ? atoi(getenv("MMVQ_FQ_GROUPPF")) : 0;
 
     auto launch = [&](auto kernel) {
         ggml_cuda_kernel_launch(kernel, launch_params, args, (const float *) y->data, ncols, 1.0f, 0.0f, 0);
     };
 
     switch (nwarps) {
-        case 16: launch(mul_mat_vec_fq_group<16, MMVQ_FQ_PF>); break;
+        case 16:
+            if (deep) {
+                if (gpf_env == 4) { launch(mul_mat_vec_fq_group<16, 4>); }
+                else              { launch(mul_mat_vec_fq_group<16, MMVQ_FQ_PF_LONG>); }
+            } else {
+                launch(mul_mat_vec_fq_group<16, MMVQ_FQ_PF>);
+            }
+            break;
         case 8:
             if (long_rows) { launch(mul_mat_vec_fq_group<8, MMVQ_FQ_PF_LONG>); }
             else           { launch(mul_mat_vec_fq_group<8, MMVQ_FQ_PF>); }
