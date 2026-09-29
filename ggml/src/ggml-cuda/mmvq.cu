@@ -1378,6 +1378,7 @@ static __global__ void mul_mat_vec_q_moe_lds_rdna3_5(
     GGML_UNUSED(ncols_x);
 }
 
+
 static constexpr __host__ __device__ int calc_rows_per_block(int ncols_dst, int table_id, bool small_k = false, int nwarps = 1) {
     if (table_id == MMVQ_PARAMETERS_RDNA3_5) {
         return 1;
@@ -1746,6 +1747,115 @@ static __device__ __forceinline__ float mmvq_fq_block_sum(const float * v, const
     const float d0 = c[0] + c[2]; // offset 2
     const float d1 = c[1] + c[3];
     return d0 + d1;               // offset 1
+}
+
+// Q5_1 MoE down (K = 640) of mul_mat_vec_q_moe_lds_rdna3_5 with the activation quantization done in the kernel:
+// each block quantizes its expert's 640 F32 activations into LDS exactly like quantize_q8_1 (per 32 values: warp
+// max, d = amax/127, roundf(x/d), the block sum in warp_reduce_sum<32> order via mmvq_fq_block_sum), which drops
+// the separate quantize_q8_1 launch. The staged rows, the K loop and the reduction are those of the LDS kernel.
+template <int rows_per_block>
+__launch_bounds__(rows_per_block * ggml_cuda_get_physical_warp_size(), 1)
+static __global__ void mul_mat_vec_q5_1_moe_fq_rdna3_5(
+        const void * vx_ptr, const float * yf_ptr, const int32_t * ids, float * dst_ptr,
+        const uint3 nchannels_y, const uint32_t nrows_x, const uint32_t stride_row_x, const uint32_t stride_channel_x,
+        const uint32_t stride_channel_y, const uint32_t stride_channel_dst) {
+    constexpr ggml_type type = GGML_TYPE_Q5_1;
+    constexpr int ncols     = 640;
+    constexpr int qk        = ggml_cuda_type_traits<type>::qk;
+    constexpr int qi        = ggml_cuda_type_traits<type>::qi;
+    constexpr int vdr       = get_vdr_mmvq(type);
+    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+    constexpr int blocks_per_row  = ncols / qk;
+    constexpr int blocks_per_iter = vdr * warp_size / qi;
+    constexpr int row_bytes = blocks_per_row * ggml_cuda_type_traits<type>::bs;
+    constexpr int row_i4    = row_bytes / 16;
+    constexpr int row_loads = (row_i4 + warp_size - 1) / warp_size;
+    constexpr int nby       = ncols / QK8_1;
+
+    __shared__ block_q8_1 s_y[nby];
+    __shared__ int4 s_rows[rows_per_block][row_i4];
+
+    const int lane = threadIdx.x;
+    const int wave = threadIdx.y;
+    const int tid  = wave * warp_size + lane;
+    const int row  = rows_per_block * blockIdx.x + wave;
+    const bool row_ok = row < (int) nrows_x;
+
+    const uint32_t channel_dst = blockIdx.y;
+    const uint32_t channel_x   = ids[channel_dst];
+    const uint32_t channel_y   = fastmodulo(channel_dst, nchannels_y);
+
+    constexpr size_t bs = ggml_cuda_type_traits<type>::bs;
+    const size_t kbx_offset = (size_t) channel_x * stride_channel_x + (size_t) (row_ok ? row : 0) * stride_row_x;
+    const int4 * gx = (const int4 *) ((const char *) vx_ptr + kbx_offset * bs);
+    int4 rx[row_loads];
+#pragma unroll
+    for (int i = 0; i < row_loads; ++i) {
+        const int idx = i * warp_size + lane;
+        if (idx < row_i4) {
+            rx[i] = gx[idx];
+        }
+    }
+
+    // quantize_q8_1 of this expert's activations: 4 lanes per Q8_1 block, 8 values per lane
+    {
+        const float * y = yf_ptr + (size_t) channel_y * stride_channel_y;
+        for (int i = tid; i < 4*nby; i += rows_per_block*warp_size) {
+            const int ib  = i >> 2;
+            const int sub = i & 3;
+            const float4 * yv = (const float4 *) (y + ib*QK8_1 + sub*8);
+            const float4 v0 = yv[0];
+            const float4 v1 = yv[1];
+            const float v[8] = {v0.x, v0.y, v0.z, v0.w, v1.x, v1.y, v1.z, v1.w};
+            float amax = fabsf(v[0]);
+#pragma unroll
+            for (int k = 1; k < 8; ++k) {
+                amax = fmaxf(amax, fabsf(v[k]));
+            }
+            amax = fmaxf(amax, __shfl_xor_sync(0xffffffff, amax, 1, warp_size));
+            amax = fmaxf(amax, __shfl_xor_sync(0xffffffff, amax, 2, warp_size));
+            const float sum = mmvq_fq_block_sum(v, warp_size);
+            const float d = amax / 127.0f;
+            int q[8];
+#pragma unroll
+            for (int k = 0; k < 8; ++k) {
+                const int8_t qk8 = amax == 0.0f ? 0 : roundf(v[k] / d);
+                q[k] = (int) qk8 & 0xff;
+            }
+            int * qs = (int *) s_y[ib].qs;
+            qs[2*sub + 0] = q[0] | (q[1] << 8) | (q[2] << 16) | (q[3] << 24);
+            qs[2*sub + 1] = q[4] | (q[5] << 8) | (q[6] << 16) | (q[7] << 24);
+            if (sub == 0) {
+                s_y[ib].ds = make_half2(d, sum);
+            }
+        }
+    }
+#pragma unroll
+    for (int i = 0; i < row_loads; ++i) {
+        const int idx = i * warp_size + lane;
+        if (idx < row_i4) {
+            s_rows[wave][idx] = rx[i];
+        }
+    }
+    __syncthreads();
+
+    if (!row_ok) {
+        return;
+    }
+
+    constexpr vec_dot_q_cuda_t vec_dot_q_cuda = get_vec_dot_q_cuda(type);
+    const void * x_l = s_rows[wave];
+    float tmp = 0.0f;
+    for (int kbx = lane / (qi/vdr); kbx < blocks_per_row; kbx += blocks_per_iter) {
+        const int kby = kbx * (qk/QK8_1);
+        const int kqs = vdr * (lane % (qi/vdr));
+        const float dot = ggml_cuda_materialize(vec_dot_q_cuda(x_l, &s_y[kby], kbx, kqs));
+        tmp = __fadd_rn(tmp, dot);
+    }
+    tmp = warp_reduce_sum<warp_size>(tmp);
+    if (lane == 0) {
+        dst_ptr[channel_dst * stride_channel_dst + row] = tmp;
+    }
 }
 
 // Register-staged Q8_0 weight loads: the K loop of one wave is split into chunks of MMVQ_FQ_PF iterations whose
@@ -3978,6 +4088,30 @@ void ggml_cuda_mul_mat_vec_q(
     }
 
     if (mul_mat_vec_q_fq_try(ctx, src0, src1, ids, dst, fusion, 1.0f, 0.0f, 0, /*launch=*/true)) {
+        return;
+    }
+
+    // decode Q5_1 MoE down (UD-Q4_K_XL ffn_down_exps, K = 640): quantize the activations inside the matvec
+    if (src0->type == GGML_TYPE_Q5_1 && ids && ne2 == 1 && ne00 == 640 && ne01 % 8 == 0 && ne03 == 1 && ne13 == 1 &&
+            !(fusion && (fusion->gate || fusion->x_bias || fusion->gate_bias || fusion->x_scale || fusion->gate_scale)) &&
+            GGML_CUDA_CC_IS_RDNA3_5(ggml_cuda_info().devices[ggml_cuda_get_device()].cc) &&
+            (uintptr_t) src1_d % 16 == 0 && nb11 % 16 == 0 && getenv("GGML_MOE_Q51_FQ") == nullptr &&
+            !(getenv("GGML_MOE_LDS_Q51") && atoi(getenv("GGML_MOE_LDS_Q51")) == 0)) {
+        static const int rows_env = getenv("GGML_MOE_Q51_FQ_ROWS") ? atoi(getenv("GGML_MOE_Q51_FQ_ROWS")) : 16;
+        auto go = [&](auto kernel, int rows) {
+            const dim3 block_nums(ne01 / rows, ne1, 1);
+            const dim3 block_dims(ggml_cuda_info().devices[ggml_cuda_get_device()].warp_size, rows, 1);
+            const ggml_cuda_kernel_launch_params params(block_nums, block_dims, 0, stream);
+            ggml_cuda_kernel_launch(kernel, params,
+                src0->data, src1_d, ids_d, dst_d, init_fastdiv_values(ne11), (uint32_t) ne01,
+                (uint32_t) (nb01 / ts_src0), (uint32_t) (nb02 / ts_src0), (uint32_t) (nb11 / ts_src1), (uint32_t) (nb1 / ts_dst));
+        };
+        switch (rows_env) {
+            case 16: go(mul_mat_vec_q5_1_moe_fq_rdna3_5<16>, 16); break;
+            case 32: go(mul_mat_vec_q5_1_moe_fq_rdna3_5<32>, 32); break;
+            case 4:  go(mul_mat_vec_q5_1_moe_fq_rdna3_5<4>, 4); break;
+            default: go(mul_mat_vec_q5_1_moe_fq_rdna3_5<8>, 8); break;
+        }
         return;
     }
 
