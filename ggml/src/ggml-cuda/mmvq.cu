@@ -2465,6 +2465,7 @@ struct mmvq_group_seg_dev {
 struct mmvq_group_args_dev {
     mmvq_group_seg_dev seg[MMVQ_GROUP_MAX];
     int nseg;
+    ggml_cuda_mm_fusion_args_device aux; // small F32 matvecs of the same activations, see mmvq_fq_aux_rows
 };
 
 template <int nwarps, int pf>
@@ -2483,6 +2484,13 @@ static __global__ void mul_mat_vec_fq_group(
 
     const int lane = threadIdx.x;
     const int tid  = warp_size*threadIdx.y + lane;
+
+    if constexpr (nwarps == 8 || nwarps == 16) {
+        if (args.aux.aux_blocks > 0 && (int) blockIdx.x >= (int) gridDim.x - args.aux.aux_blocks) {
+            mmvq_fq_aux_rows<nwarps / 8>(args.aux, y_ptr, (int) blockIdx.x - ((int) gridDim.x - args.aux.aux_blocks));
+            return;
+        }
+    }
 
     // segment lookup, uniform per block
     int s = 0;
@@ -2684,6 +2692,29 @@ void ggml_cuda_mmv_group(ggml_backend_cuda_context & ctx, const ggml_tensor * y,
         d.glu_op       = (int) segs[i].glu_op;
         d.glu_limit    = segs[i].glu_limit;
         nblocks += (d.nrows + nwarps - 1) / nwarps;
+    }
+
+    if (g_mmvq_fq_aux.nseg > 0 && !g_mmvq_fq_aux.used && (nwarps == 8 || nwarps == 16)) {
+        int total = 0;
+        bool ok = true;
+        for (int i = 0; i < g_mmvq_fq_aux.nseg; ++i) {
+            const ggml_tensor * w = g_mmvq_fq_aux.w[i];
+            ok = ok && w->ne[0] == ncols && w->nb[0] == sizeof(float) && w->nb[1] % sizeof(float) == 0;
+            args.aux.aux_w[i]      = (const float *) w->data;
+            args.aux.aux_dst[i]    = (float *) g_mmvq_fq_aux.dst[i]->data;
+            args.aux.aux_rows[i]   = (int) w->ne[1];
+            args.aux.aux_stride[i] = (int) (w->nb[1] / sizeof(float));
+            total += (int) w->ne[1];
+        }
+        if (ok) {
+            args.aux.aux_nseg   = g_mmvq_fq_aux.nseg;
+            args.aux.aux_ncols2 = ncols / 2;
+            args.aux.aux_blocks = (total + nwarps/8 - 1) / (nwarps/8);
+            nblocks += args.aux.aux_blocks;
+            g_mmvq_fq_aux.used = true;
+        } else {
+            args.aux = {};
+        }
     }
 
     const dim3 block_nums(nblocks, 1, 1);
