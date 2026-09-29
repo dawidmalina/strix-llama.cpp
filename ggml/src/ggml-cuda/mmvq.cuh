@@ -51,3 +51,10 @@ void ggml_cuda_mul_mat_id_weighted_rdna3_5(
 // 256 in mul_mat_vec_f) to that launch. ggml_cuda_mmvq_fq_aux_take() tells whether the pending set was consumed.
 void ggml_cuda_mmvq_fq_aux_set(const ggml_tensor * const * w, ggml_tensor * const * dst, int nseg);
 bool ggml_cuda_mmvq_fq_aux_take();
+
+// RDNA3.5 qwen4exp hyper-connection gate GEMM (fused-quantize Q8_0 with the scale -> silu/sigmoid prologue) whose
+// only consumer is the 4-stream mix: dst[e] = mix_scale * sum_c(xn[e + c*n_embd] * sigmoid(gate[e + c*n_embd])) + mix_bias
+bool ggml_cuda_mul_mat_vec_q_fq_hcmix_ok(ggml_backend_cuda_context & ctx, const ggml_tensor * mm, const ggml_tensor * y,
+        const ggml_tensor * xn, const ggml_tensor * dst, int hc);
+void ggml_cuda_mul_mat_vec_q_fq_hcmix(ggml_backend_cuda_context & ctx, const ggml_tensor * mm, const ggml_tensor * y,
+        float y_scale, float y_bias, int y_op, const ggml_tensor * xn, ggml_tensor * dst, float mix_scale, float mix_bias);

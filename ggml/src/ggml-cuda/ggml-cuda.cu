@@ -6296,6 +6296,19 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         const int y_op = ggml_get_unary_op(cgraph->nodes[i + 1]) == GGML_UNARY_OP_SILU ? 1 : 2;
         ggml_tensor * mm = cgraph->nodes[i + 2];
 
+        // qwen4exp: the gate GEMM only feeds the hyper-connection stream mix -> GEMM + mix in one kernel
+        if (i + 3 < cgraph->n_nodes && getenv("GGML_CUDA_DISABLE_HC_UPMIX") == nullptr && ggml_node_has_n_uses(cgraph, i + 2, 1) &&
+                (mm->flags & GGML_TENSOR_FLAG_OUTPUT) == 0) {
+            ggml_cuda_hc_mix_args ma;
+            const int count = ggml_cuda_hc_mix_closed(cgraph, i + 3, ma);
+            if (count > 0 && ma.gate == mm && ma.dst->ne[1] == 1 &&
+                    ggml_cuda_mul_mat_vec_q_fq_hcmix_ok(*cuda_ctx, mm, node->src[0], ma.xn, ma.dst, ma.hc)) {
+                ggml_cuda_mul_mat_vec_q_fq_hcmix(*cuda_ctx, mm, node->src[0],
+                    ggml_get_op_params_f32(node, 0), ggml_get_op_params_f32(node, 1), y_op, ma.xn, ma.dst, ma.scale, ma.bias);
+                return 2 + count;
+            }
+        }
+
         ggml_cuda_mul_mat_vec_q_fq_prologue(*cuda_ctx, mm, node->src[0],
             ggml_get_op_params_f32(node, 0), ggml_get_op_params_f32(node, 1), y_op);
         return 2;
