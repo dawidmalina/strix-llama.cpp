@@ -1799,6 +1799,78 @@ static __device__ __forceinline__ void mmvq_fq_q8_0_dot(
     }
 }
 
+
+// Extra blocks of the fused-quantize Q8_0 matvec that compute small F32 matvecs sharing its F32 activations
+// (qwen4exp: hc_*_inject [10240 x 4] next to hc_*_down). Each group of 8 waves replays one row of
+// mul_mat_vec_f<float, float, 1, 256>: same lane -> column map, same 4-deep load batching and ggml_cuda_mad order,
+// same two-stage reduction over a zeroed 32-entry buffer, so the results are bit-identical.
+template <int rows_per_block>
+static __device__ __forceinline__ void mmvq_fq_aux_rows(const ggml_cuda_mm_fusion_args_device & f, const float * y, const int ablock) {
+    constexpr int block_size = 256;
+    constexpr int warp_size  = 32;
+    __shared__ float buf_iw[rows_per_block][warp_size];
+
+    const int sub  = threadIdx.y / 8;
+    const int tid  = (threadIdx.y % 8) * warp_size + threadIdx.x;
+    int       r    = ablock * rows_per_block + sub;
+    int       seg  = 0;
+    if (r >= f.aux_rows[0]) {
+        r  -= f.aux_rows[0];
+        seg = 1;
+    }
+    const bool valid = seg < f.aux_nseg && r < f.aux_rows[seg];
+
+    if (tid < warp_size) {
+        buf_iw[sub][tid] = 0.0f;
+    }
+    __syncthreads();
+
+    float sumf = 0.0f;
+    if (valid) {
+        const float2 * x2 = (const float2 *) (f.aux_w[seg] + (int64_t) r * f.aux_stride[seg]);
+        const float2 * y2 = (const float2 *) y;
+        const int ncols2 = f.aux_ncols2;
+        int col2 = tid;
+        constexpr int pf = 4;
+        for (; col2 + (pf - 1)*block_size < ncols2; col2 += pf*block_size) {
+            float2 tmpx[pf];
+            float2 tmpy[pf];
+#pragma unroll
+            for (int i = 0; i < pf; ++i) {
+                tmpx[i] = x2[col2 + i*block_size];
+            }
+#pragma unroll
+            for (int i = 0; i < pf; ++i) {
+                tmpy[i] = y2[col2 + i*block_size];
+            }
+#pragma unroll
+            for (int i = 0; i < pf; ++i) {
+                ggml_cuda_mad(sumf, tmpx[i].x, tmpy[i].x);
+                ggml_cuda_mad(sumf, tmpx[i].y, tmpy[i].y);
+            }
+        }
+        for (; col2 < ncols2; col2 += block_size) {
+            const float2 tmpx = x2[col2];
+            const float2 tmpy = y2[col2];
+            ggml_cuda_mad(sumf, tmpx.x, tmpy.x);
+            ggml_cuda_mad(sumf, tmpx.y, tmpy.y);
+        }
+    }
+
+    sumf = warp_reduce_sum<warp_size>(sumf);
+    buf_iw[sub][tid/warp_size] = sumf;
+    __syncthreads();
+    if (tid < warp_size) {
+        sumf = buf_iw[sub][tid];
+        sumf = warp_reduce_sum<warp_size>(sumf);
+    }
+    __syncthreads();
+
+    if (valid && tid == 0) {
+        f.aux_dst[seg][r] = sumf;
+    }
+}
+
 template <ggml_type type, bool has_fusion, int nwarps, int pf>
 __launch_bounds__(nwarps * ggml_cuda_get_physical_warp_size(), 1)
 static __global__ void mul_mat_vec_q_fq(
@@ -1810,6 +1882,12 @@ static __global__ void mul_mat_vec_q_fq(
         const float y_scale, const float y_bias, const int y_op) {
     static_assert(mmvq_fq_type_ok(type));
     constexpr bool q8_0_path = type == GGML_TYPE_Q8_0;
+    if constexpr (q8_0_path && !has_fusion && (nwarps == 8 || nwarps == 16)) {
+        if (fusion.aux_blocks > 0 && (int) blockIdx.x >= (int) gridDim.x - fusion.aux_blocks) {
+            mmvq_fq_aux_rows<nwarps / 8>(fusion, y_ptr, (int) blockIdx.x - ((int) gridDim.x - fusion.aux_blocks));
+            return;
+        }
+    }
     const void    * GGML_CUDA_RESTRICT vx  = vx_ptr;
     const int32_t * GGML_CUDA_RESTRICT ids = ids_ptr;
     float         * GGML_CUDA_RESTRICT dst = dst_ptr;
@@ -2170,6 +2248,30 @@ static __global__ void mul_mat_vec_q_fq_q8_rows_nofuse(
     }
 }
 
+struct mmvq_fq_aux_pending {
+    const ggml_tensor * w[2]   = { nullptr, nullptr };
+    ggml_tensor *       dst[2] = { nullptr, nullptr };
+    int                 nseg   = 0;
+    bool                used   = false;
+};
+static mmvq_fq_aux_pending g_mmvq_fq_aux;
+
+void ggml_cuda_mmvq_fq_aux_set(const ggml_tensor * const * w, ggml_tensor * const * dst, int nseg) {
+    GGML_ASSERT(nseg >= 1 && nseg <= 2);
+    g_mmvq_fq_aux = {};
+    for (int i = 0; i < nseg; ++i) {
+        g_mmvq_fq_aux.w[i]   = w[i];
+        g_mmvq_fq_aux.dst[i] = dst[i];
+    }
+    g_mmvq_fq_aux.nseg = nseg;
+}
+
+bool ggml_cuda_mmvq_fq_aux_take() {
+    const bool used = g_mmvq_fq_aux.used;
+    g_mmvq_fq_aux = {};
+    return used;
+}
+
 template <ggml_type type>
 static void mul_mat_vec_q_fq_launch(
         const void * vx, const float * y, const int32_t * ids, const ggml_cuda_mm_fusion_args_device & fusion, float * dst,
@@ -2202,16 +2304,44 @@ static void mul_mat_vec_q_fq_launch(
         }
     }
 
-    const dim3 block_nums((nrows_x + nwarps - 1) / nwarps, nchannels_dst, nsamples_dst);
+    const bool has_fusion = fusion.gate != nullptr || fusion.x_bias != nullptr || fusion.gate_bias != nullptr;
+
+    ggml_cuda_mm_fusion_args_device fusion_eff = fusion;
+    int aux_blocks = 0;
+    if (g_mmvq_fq_aux.nseg > 0 && !g_mmvq_fq_aux.used && type == GGML_TYPE_Q8_0 && !has_fusion && ids == nullptr &&
+            nchannels_dst == 1 && nsamples_dst == 1 && y_op == 0 && ncols_x > 512 && (nwarps == 8 || nwarps == 16) &&
+            !getenv("MMVQ_FQ_NW")) {
+        int total = 0;
+        bool ok = true;
+        for (int i = 0; i < g_mmvq_fq_aux.nseg; ++i) {
+            const ggml_tensor * w = g_mmvq_fq_aux.w[i];
+            ok = ok && w->ne[0] == ncols_x && w->nb[0] == sizeof(float) && w->nb[1] % sizeof(float) == 0;
+            fusion_eff.aux_w[i]      = (const float *) w->data;
+            fusion_eff.aux_dst[i]    = (float *) g_mmvq_fq_aux.dst[i]->data;
+            fusion_eff.aux_rows[i]   = (int) w->ne[1];
+            fusion_eff.aux_stride[i] = (int) (w->nb[1] / sizeof(float));
+            total += (int) w->ne[1];
+        }
+        if (ok) {
+            fusion_eff.aux_nseg   = g_mmvq_fq_aux.nseg;
+            fusion_eff.aux_ncols2 = ncols_x / 2;
+            aux_blocks = (total + nwarps/8 - 1) / (nwarps/8);
+            fusion_eff.aux_blocks = aux_blocks;
+            g_mmvq_fq_aux.used = true;
+        } else {
+            fusion_eff = fusion;
+        }
+    }
+
+    const dim3 block_nums((nrows_x + nwarps - 1) / nwarps + aux_blocks, nchannels_dst, nsamples_dst);
     const dim3 block_dims(warp_size, nwarps, 1);
     const int  nbytes_shared = (ncols_x / QK8_1) * sizeof(block_q8_1);
 
-    const bool has_fusion = fusion.gate != nullptr || fusion.x_bias != nullptr || fusion.gate_bias != nullptr;
     const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, nbytes_shared, stream);
 
     auto launch = [&](auto kernel) {
         ggml_cuda_kernel_launch(kernel, launch_params,
-            vx, y, ids, fusion, dst, ncols_x, nrows_x, nchannels_y_fd, stride_row_x, stride_col_dst,
+            vx, y, ids, fusion_eff, dst, ncols_x, nrows_x, nchannels_y_fd, stride_row_x, stride_col_dst,
             channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst,
             sample_ratio_fd, stride_sample_x, stride_sample_y, stride_sample_dst, y_scale, y_bias, y_op);
     };

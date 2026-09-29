@@ -4549,6 +4549,57 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         }
     }
 
+    // one-token F32 matvec with few rows (qwen4exp hc_*_inject [10240 x 4]) followed by a Q8_0 matvec of the same
+    // activations (hc_*_down): the F32 rows ride along as extra blocks of the fused-quantize Q8_0 launch
+    if (node->op == GGML_OP_MUL_MAT && GGML_CUDA_CC_IS_RDNA3_5(ggml_cuda_info().devices[cuda_ctx->device].cc) &&
+            getenv("GGML_CUDA_DISABLE_FQ_AUX") == nullptr) {
+        const ggml_tensor * w = node->src[0];
+        const ggml_tensor * y = node->src[1];
+        auto f32_small_ok = [&](const ggml_tensor * mm) {
+            const ggml_tensor * a = mm->src[0];
+            const ggml_tensor * b = mm->src[1];
+            if (!(a && b && a->type == GGML_TYPE_F32 && b->type == GGML_TYPE_F32 && mm->type == GGML_TYPE_F32 &&
+                    a->ne[2] == 1 && a->ne[3] == 1 && a->ne[1] <= 128 && a->nb[0] == sizeof(float) && ggml_is_contiguous(a) &&
+                    ggml_nelements(b) == a->ne[0] && ggml_is_contiguous(b) && ggml_is_contiguous(mm) &&
+                    ggml_nelements(mm) == a->ne[1] && a->ne[0] % 2 == 0 && (mm->flags & GGML_TENSOR_FLAG_OUTPUT) == 0)) {
+                return false;
+            }
+            // mul_mat_vec_f picks the smallest block giving the fewest K iterations: must be 256 to be replayed
+            const int64_t ncols = a->ne[0];
+            int64_t block_size_best = 32;
+            int64_t niter_best      = (ncols + 2*32 - 1) / (2*32);
+            for (int64_t bs = 64; bs <= 256; bs += 32) {
+                const int64_t niter = (ncols + 2*bs - 1) / (2*bs);
+                if (niter < niter_best) {
+                    niter_best      = niter;
+                    block_size_best = bs;
+                }
+            }
+            return block_size_best == 256;
+        };
+        if (f32_small_ok(node)) {
+            int j = i + 1;
+            while (j < cgraph->n_nodes && j <= i + 4 && ggml_cuda_is_view_or_noop(cgraph->nodes[j])) {
+                j++;
+            }
+            ggml_tensor * mm = j < cgraph->n_nodes ? cgraph->nodes[j] : nullptr;
+            if (mm && mm->op == GGML_OP_MUL_MAT && mm->src[1] == y && mm->src[0]->type == GGML_TYPE_Q8_0 &&
+                    mm->src[0]->ne[0] == w->ne[0] && mm->src[0]->ne[1] > 128 && ggml_nrows(y) == 1 &&
+                    (mm->flags & GGML_TENSOR_FLAG_COMPUTE) != 0 && mm->src[2] == nullptr) {
+                const ggml_tensor * ws[1] = { w };
+                ggml_tensor *       ds[1] = { node };
+                ggml_cuda_mmvq_fq_aux_set(ws, ds, 1);
+                const bool ok = ggml_cuda_compute_forward(*cuda_ctx, mm);
+                GGML_ASSERT(ok);
+                if (!ggml_cuda_mmvq_fq_aux_take()) {
+                    const bool ok2 = ggml_cuda_compute_forward(*cuda_ctx, node);
+                    GGML_ASSERT(ok2);
+                }
+                return j - i;
+            }
+        }
+    }
+
     if (node->op == GGML_OP_MUL_MAT && GGML_CUDA_CC_IS_RDNA3_5(ggml_cuda_info().devices[cuda_ctx->device].cc)) {
         ggml_cuda_idx_relu_sum_args args;
         const int count = ggml_cuda_match_idx_gemm(*cuda_ctx, cgraph, i, args);

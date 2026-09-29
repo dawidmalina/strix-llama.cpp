@@ -46,3 +46,8 @@ void ggml_cuda_mul_mat_vec_q_fq_gdn_gate(ggml_backend_cuda_context & ctx, ggml_t
 bool ggml_cuda_mul_mat_id_weighted_rdna3_5_ok(const ggml_tensor * experts, const ggml_tensor * weights, const ggml_tensor * dst);
 void ggml_cuda_mul_mat_id_weighted_rdna3_5(
         ggml_backend_cuda_context & ctx, const ggml_tensor * experts, const ggml_tensor * weights, ggml_tensor * dst);
+
+// RDNA3.5: attach up to two small F32 matvecs (same activations as the next fused-quantize Q8_0 matvec, block size
+// 256 in mul_mat_vec_f) to that launch. ggml_cuda_mmvq_fq_aux_take() tells whether the pending set was consumed.
+void ggml_cuda_mmvq_fq_aux_set(const ggml_tensor * const * w, ggml_tensor * const * dst, int nseg);
+bool ggml_cuda_mmvq_fq_aux_take();
