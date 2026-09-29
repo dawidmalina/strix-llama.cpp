@@ -6225,6 +6225,107 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     return 0;
 }
 
+// Deferred inputs: a host producer (e.g. the qwen4exp PLE rows read from disk) hands over an input tensor whose
+// data is not ready yet. The graph is launched anyway and the upload is enqueued in stream order right before the
+// first node that reads the tensor, so the GPU runs everything in front of that node while the host finishes the
+// data. The wait function blocks until the data is ready and returns the host pointer to copy from. The uploaded
+// bytes and the kernels are the same as with a synchronous ggml_backend_tensor_set, so results do not change.
+typedef const void * (*ggml_cuda_deferred_input_wait_t)(void * user_data);
+
+struct ggml_cuda_deferred_input {
+    ggml_tensor *                   tensor;
+    ggml_cuda_deferred_input_wait_t wait;
+    void *                          user_data;
+    int                             flush_at; // node index at which the upload is enqueued
+};
+
+static std::mutex                            ggml_cuda_deferred_mutex;
+static std::vector<ggml_cuda_deferred_input> ggml_cuda_deferred_inputs;
+
+static bool ggml_backend_cuda_defer_input(ggml_tensor * tensor, ggml_cuda_deferred_input_wait_t wait, void * user_data) {
+    if (tensor == nullptr || wait == nullptr || tensor->buffer == nullptr || !ggml_is_contiguous(tensor)) {
+        return false;
+    }
+    // device memory, or pinned host memory the kernels of an integrated GPU read in place
+    if (!ggml_backend_buffer_is_cuda(tensor->buffer) && !ggml_backend_buft_is_cuda_host(tensor->buffer->buft)) {
+        return false;
+    }
+    std::lock_guard<std::mutex> lock(ggml_cuda_deferred_mutex);
+    ggml_cuda_deferred_inputs.push_back({ tensor, wait, user_data, 0 });
+    return true;
+}
+
+static bool ggml_cuda_deferred_pending() {
+    std::lock_guard<std::mutex> lock(ggml_cuda_deferred_mutex);
+    return !ggml_cuda_deferred_inputs.empty();
+}
+
+static bool ggml_cuda_tensor_reads(const ggml_tensor * node, const ggml_tensor * t) {
+    for (int j = 0; j < GGML_MAX_SRC; ++j) {
+        const ggml_tensor * src = node->src[j];
+        for (int depth = 0; src != nullptr && depth < 4; ++depth) {
+            if (src == t) {
+                return true;
+            }
+            src = src->view_src;
+        }
+    }
+    return false;
+}
+
+static void ggml_cuda_deferred_upload(ggml_backend_cuda_context * cuda_ctx, const ggml_cuda_deferred_input & d) {
+    const void * data = d.wait(d.user_data);
+    GGML_ASSERT(data != nullptr);
+    if (ggml_backend_buft_is_cuda_host(d.tensor->buffer->buft)) {
+        // no kernel reading the tensor has been enqueued yet, and the previous graph finished before its inputs
+        // were set, so the host can write it in place; the next launch orders the write before the reader
+        memcpy(d.tensor->data, data, ggml_nbytes(d.tensor));
+        return;
+    }
+    ggml_cuda_set_device(cuda_ctx->device);
+    CUDA_CHECK(cudaMemcpyAsync(d.tensor->data, data, ggml_nbytes(d.tensor), cudaMemcpyHostToDevice, cuda_ctx->stream()));
+}
+
+// Place each upload a few nodes in front of the first node that reads the tensor (a fusion can start before the
+// reading node and read it from an earlier position).
+static bool ggml_cuda_deferred_prepare(ggml_cgraph * cgraph) {
+    std::lock_guard<std::mutex> lock(ggml_cuda_deferred_mutex);
+    if (ggml_cuda_deferred_inputs.empty()) {
+        return false;
+    }
+    constexpr int lookahead = 24;
+    for (auto & d : ggml_cuda_deferred_inputs) {
+        int first = cgraph->n_nodes;
+        for (int k = 0; k < cgraph->n_nodes; ++k) {
+            if (ggml_cuda_tensor_reads(cgraph->nodes[k], d.tensor)) {
+                first = k;
+                break;
+            }
+        }
+        d.flush_at = std::max(0, first - lookahead);
+    }
+    return true;
+}
+
+// Uploads that are due at node i, or all of them when i < 0.
+static void ggml_cuda_deferred_flush(ggml_backend_cuda_context * cuda_ctx, int i) {
+    std::vector<ggml_cuda_deferred_input> due;
+    {
+        std::lock_guard<std::mutex> lock(ggml_cuda_deferred_mutex);
+        for (auto it = ggml_cuda_deferred_inputs.begin(); it != ggml_cuda_deferred_inputs.end(); ) {
+            if (i < 0 || i >= it->flush_at) {
+                due.push_back(*it);
+                it = ggml_cuda_deferred_inputs.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    }
+    for (const auto & d : due) {
+        ggml_cuda_deferred_upload(cuda_ctx, d);
+    }
+}
+
 static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, const bool use_cuda_graph, const bool cuda_graph_update_required, const void * graph_key) {
     bool graph_evaluated_or_captured = false;
 
@@ -6323,8 +6424,13 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 stream_ctx.concurrent_events.clear();
             }
 
+            bool has_deferred = ggml_cuda_deferred_prepare(cgraph);
             for (int i = 0; i < cgraph->n_nodes; i++) {
                 ggml_tensor * node = cgraph->nodes[i];
+                if (has_deferred) {
+                    ggml_cuda_deferred_flush(cuda_ctx, i);
+                    has_deferred = ggml_cuda_deferred_pending();
+                }
                 if (is_concurrent_event_active) {
                     GGML_ASSERT(concurrent_event);
 
@@ -6408,6 +6514,9 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                }
             }
         }
+
+        // a deferred input that no node of this graph reads is still uploaded before the graph returns
+        ggml_cuda_deferred_flush(cuda_ctx, -1);
 
 #ifdef USE_CUDA_GRAPH
         ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
@@ -6511,7 +6620,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     ggml_cuda_graph_set_enabled(cuda_ctx, graph_key);
 
     ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
-    if (graph->is_enabled()) {
+    if (graph->is_enabled() && !ggml_cuda_deferred_pending()) {
         const bool graph_compatible = ggml_cuda_graph_check_compability(cgraph);
         if (graph_compatible) {
             const bool properties_changed = ggml_cuda_graph_update_required(cuda_ctx, cgraph);
@@ -8223,6 +8332,9 @@ static void ggml_backend_cuda_set_mmb_enabled(ggml_backend_t backend, bool enabl
 
 static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     GGML_UNUSED(reg);
+    if (strcmp(name, "ggml_backend_cuda_defer_input") == 0) {
+        return (void *)ggml_backend_cuda_defer_input;
+    }
     if (strcmp(name, "ggml_backend_cuda_set_mmb_enabled") == 0) {
         return (void *)ggml_backend_cuda_set_mmb_enabled;
     }
