@@ -4546,6 +4546,37 @@ static bool ggml_cuda_fq_aux_f32_ok(const ggml_tensor * mm) {
     return block_size_best == 256;
 }
 
+// Aliasing rules of the decode MoE epilogue kernel (every block reads the whole gate row w and activations y, then
+// each thread reads column col of the experts / shared-expert output and writes column col of dst): dst must not
+// overlap w, y, the routing weights or scales, and may overlap an expert row or the shared-expert output only exactly.
+static bool ggml_cuda_moe_epi_alias_ok(const ggml_tensor * dst, const ggml_tensor * gate_mm,
+        const ggml_cuda_moe_weighted_reduction_match & red, const ggml_tensor * shexp) {
+    auto range = [](const ggml_tensor * t, uintptr_t & a, uintptr_t & b) { a = (uintptr_t) t->data; b = a + ggml_nbytes(t); };
+    uintptr_t d0, d1;
+    range(dst, d0, d1);
+    auto disjoint = [&](const ggml_tensor * t) {
+        if (t == nullptr) { return true; }
+        uintptr_t a, b; range(t, a, b);
+        return d1 <= a || b <= d0;
+    };
+    // single block: y (gate_mm->src[1]) is fully read before the first column is written, so it may alias dst
+    if (!disjoint(gate_mm->src[0]) || !disjoint(gate_mm) || !disjoint(red.weights) ||
+            !disjoint(red.expert_scale)) {
+        return false;
+    }
+    if (!disjoint(shexp) && shexp->data != dst->data) {
+        return false;
+    }
+    if (!disjoint(red.experts)) {
+        const uintptr_t e0 = (uintptr_t) red.experts->data;
+        const size_t row = ggml_nbytes(dst);
+        if (d0 < e0 || (d0 - e0) % row != 0) {
+            return false;
+        }
+    }
+    return true;
+}
+
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
     static bool disable_fusion = getenv("GGML_CUDA_DISABLE_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_FUSION"));
@@ -5241,6 +5272,49 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         if (types_ok && shape_ok && dim_ok && contig_ok && x_in_add == x) {
             ggml_cuda_op_snake_fused(*cuda_ctx, x, a, inv_b, add);
             return 4;
+        }
+    }
+
+    // MoE decode epilogue: mul_mat(w [n_embd, 1], y) -> [routed-expert weighted reduction] -> sigmoid -> mul -> add.
+    // graph_optimize rotated the reduction chain right behind the matvec; the gate dot and the reduction + merge are
+    // computed by one kernel with the same per-element expressions as shared_gate_mul_add_f32 and reduction_f32_v4.
+    if (node->op == GGML_OP_MUL_MAT && i + 3 < cgraph->n_nodes && node->type == GGML_TYPE_F32 &&
+        node->src[0] && node->src[1] && node->src[0]->type == GGML_TYPE_F32 && node->src[1]->type == GGML_TYPE_F32 &&
+        node->src[0]->ne[0] % 2 == 0 && ggml_nelements(node->src[0]) == node->src[0]->ne[0] &&
+        ggml_nelements(node->src[1]) == node->src[0]->ne[0] && ggml_nelements(node) == 1 &&
+        ggml_is_contiguous(node->src[0]) && ggml_is_contiguous(node->src[1]) &&
+        ggml_cuda_moe_sgma_enabled() && GGML_CUDA_CC_IS_AMD(ggml_cuda_info().devices[cuda_ctx->device].cc)) {
+        // the fused kernel replays mul_mat_vec_f<float, float, 1, 256>: only valid where mmvf would pick that block size
+        const int64_t ncols = node->src[0]->ne[0];
+        const int     warp_size = ggml_cuda_info().devices[cuda_ctx->device].warp_size;
+        int64_t block_size_best = warp_size;
+        int64_t niter_best      = (ncols + 2*warp_size - 1) / (2*warp_size);
+        for (int64_t block_size = 2*warp_size; block_size <= 256; block_size += warp_size) {
+            const int64_t niter = (ncols + 2*block_size - 1) / (2*block_size);
+            if (niter < niter_best) {
+                niter_best      = niter;
+                block_size_best = block_size;
+            }
+        }
+        ggml_cuda_moe_weighted_reduction_match red;
+        const bool redm = ggml_cuda_match_moe_weighted_reduction(cgraph, i + 1, red);
+        if (block_size_best == 256 && warp_size == 32 && redm) {
+            const int base = i + 1 + red.node_count;
+            if (base + 2 < cgraph->n_nodes) {
+                const ggml_tensor * sig = cgraph->nodes[base];
+                ggml_tensor * mul  = cgraph->nodes[base + 1];
+                ggml_tensor * add  = cgraph->nodes[base + 2];
+                const int out_idx = base + 2;
+                if ((node->flags & GGML_TENSOR_FLAG_OUTPUT) == 0 && sig->src[0] == node &&
+                        ggml_node_has_n_uses(cgraph, i, 1) && ggml_node_has_n_uses(cgraph, base - 1, 1) &&
+                        ggml_node_has_n_uses(cgraph, base, 1) && ggml_node_has_n_uses(cgraph, base + 1, 1) &&
+                        ggml_cuda_moe_sgma_tail(red, sig, mul, add) &&
+                        ggml_cuda_moe_epi_alias_ok(add, node, red, mul->src[0])) {
+                    ggml_cuda_op_shared_gate_mul_add_reduce(*cuda_ctx, node, red.experts, red.expert_scale, red.weights,
+                        mul->src[0], add, (int) red.weights->ne[1]);
+                    return base + 2 - i;
+                }
+            }
         }
     }
 
@@ -6884,7 +6958,13 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
         for (int i = 0; i < cgraph->n_nodes; ++i) {
             if (cgraph->nodes[i]->op != GGML_OP_MUL) continue;
             ggml_cuda_moe_weighted_reduction_match mm;
-            if (!ggml_cuda_match_moe_weighted_reduction(cgraph, i, mm) || ggml_nrows(mm.dst) < 512) continue;
+            if (!ggml_cuda_match_moe_weighted_reduction(cgraph, i, mm)) continue;
+            // prefill rotates the reduction below the shared-expert GEMMs; a single token also folds the gate matvec
+            // into the fused kernel, so the reduction's tail starts right behind it (see ggml_cuda_try_fuse)
+            if (ggml_nrows(mm.dst) != 1 && ggml_nrows(mm.dst) < 512) continue;
+            // a single-token reduction the down GEMM folds in (IQ4_NL / Q8_0 weighted kernels) must stay right behind it
+            if (ggml_nrows(mm.dst) == 1 && getenv("GGML_CUDA_DISABLE_WEIGHTED_DOWN") == nullptr &&
+                    ggml_cuda_mul_mat_id_weighted_rdna3_5_ok(mm.experts, mm.weights, mm.dst)) continue;
             const int cnt = mm.node_count;
             int k = -1;
             for (int n = i + cnt; n + 2 < cgraph->n_nodes && n <= i + cnt + 24; ++n) {
