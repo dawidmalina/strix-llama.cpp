@@ -1,0 +1,82 @@
+#!/usr/bin/env bash
+# On-demand model correctness on a Strix Halo machine: this fork vs the upstream llama.cpp commit it is based on.
+# Runs correctness.sh (next to this file) in the ROCm container ($IMAGE) with the GPU passed through.
+#
+#   strix-correctness                          # fork master
+#   strix-correctness pr/136                   # a PR, posts the result as a PR comment (NO_COMMENT=1 to skip; needs gh auth)
+#   strix-correctness my-branch                # a branch or commit of the fork
+#   strix-correctness ~/src/strix-llama.cpp    # a local checkout (its current HEAD)
+#
+# Expects models in ~/models/ci and ~/wikitext-2-raw/wiki.test.raw. Limits: PPL_TOL, TOP_TOL, KLD_TOL, CHUNKS.
+# Results: ~/correctness-run/results/<date>-<commit>/summary.md (+ logs)
+set -euo pipefail
+
+TARGET=${1:-master}
+W=$HOME/correctness-run
+REPO=https://github.com/halo-box/strix-llama.cpp.git
+IMAGE=${IMAGE:-strix-rocm100:repro}
+# docker (as the calling user) or rootless podman (root in the container == the calling user on the host)
+ENGINE=${ENGINE:-docker}
+if [[ $ENGINE == docker ]]; then USER_ARGS=(--user "$(id -u):$(id -g)" -e HOME=/tmp); else USER_ARGS=(); fi
+SCRIPT=${SCRIPT:-$(dirname "$(realpath "$0")")/correctness.sh}
+mkdir -p "$W/cache" "$W/results"
+
+if [[ -d $TARGET ]]; then
+    SRC=$(realpath "$TARGET")
+else
+    SRC=$W/src
+    [[ -d $SRC/.git ]] || git clone -q --filter=blob:none "$REPO" "$SRC"
+    case $TARGET in
+        pr/*) REF=refs/pull/${TARGET#pr/}/head ;;
+        *)    REF=$TARGET ;;
+    esac
+    git -C "$SRC" fetch -q origin "$REF"
+    git -C "$SRC" checkout -q --force FETCH_HEAD
+fi
+
+SHA=$(git -C "$SRC" rev-parse --short HEAD)
+OUT=$W/results/$(date +%Y%m%d-%H%M%S)-$SHA
+mkdir -p "$OUT"
+ln -sfn "$OUT" "$W/results/latest"
+echo "fork $TARGET ($SHA) -> $OUT"
+
+set +e
+"$ENGINE" run --rm "${USER_ARGS[@]}" \
+    --device /dev/kfd --device /dev/dri/renderD128 --security-opt label=disable \
+    -v "$SRC":/src -w /src \
+    -v "$SCRIPT":/correctness.sh:ro \
+    -v "$HOME/models":/hostmodels:ro -e MODELS_DIR=/hostmodels/ci \
+    -v "$HOME/wikitext-2-raw":/data:ro -e TEXT=/data/wiki.test.raw \
+    -v "$W/cache":/cache -e CACHE=/cache \
+    -v "$OUT":/out -e OUT=/out \
+    -e LD_LIBRARY_PATH=/opt/rocm/lib \
+    ${PPL_TOL:+-e PPL_TOL=$PPL_TOL} ${TOP_TOL:+-e TOP_TOL=$TOP_TOL} ${KLD_TOL:+-e KLD_TOL=$KLD_TOL} ${CHUNKS:+-e CHUNKS=$CHUNKS} \
+    "$IMAGE" bash /correctness.sh 2>&1 | tee "$OUT/run.log"
+status=${PIPESTATUS[0]}
+set -e
+
+[[ -n ${GITHUB_STEP_SUMMARY:-} && -f $OUT/summary.md ]] && cat "$OUT/summary.md" >> "$GITHUB_STEP_SUMMARY"
+
+# PR: publish the result as a comment (needs `gh auth login` once on this machine; NO_COMMENT=1 to skip)
+if [[ $TARGET == pr/* && -z ${NO_COMMENT:-} ]]; then
+    PR=${TARGET#pr/}
+    if [[ -f $OUT/summary.md ]]; then
+        verdict=$([[ $status -eq 0 ]] && echo "PASSED" || echo "FAILED")
+        {
+            echo "**Strix Halo correctness: $verdict** (on \`strix-halo-001\`, gfx1151, ROCm, image \`$IMAGE\`)"
+            echo
+            cat "$OUT/summary.md"
+            echo
+            if [[ -n ${GITHUB_RUN_ID:-} ]]; then
+                echo "<sub>[Workflow run]($GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID), $(date -u '+%Y-%m-%d %H:%M UTC'). Logs are in the run artifacts.</sub>"
+            else
+                echo "<sub>Run with \`strix-correctness pr/$PR\` on $(date -u '+%Y-%m-%d %H:%M UTC'). Logs on the machine in \`$OUT\`.</sub>"
+            fi
+        } > "$OUT/comment.md"
+        gh pr comment "$PR" -R halo-box/strix-llama.cpp --body-file "$OUT/comment.md" \
+            && echo "comment posted on PR #$PR" || echo "could not post the comment (gh auth login, or GH_TOKEN?)"
+    else
+        echo "no summary.md, nothing posted"
+    fi
+fi
+exit "$status"

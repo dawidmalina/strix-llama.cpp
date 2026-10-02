@@ -1,0 +1,82 @@
+# Model correctness on Strix Halo (gfx1151, ROCm): this fork vs the upstream llama.cpp commit it is based on.
+# Runs automatically on PRs and pushes to master that touch the inference code, and by hand from
+# Actions -> "Strix Halo correctness" -> Run workflow (write access required).
+# PRs from outside contributors only run after a maintainer approves the run (repository setting).
+#
+# Runs ci/strix-halo/strix-correctness on the self-hosted runner labelled [stx-halo, Linux, gfx1151]
+# (strix-halo-001, unprivileged user, rootless podman). For a PR, the result table is posted as a PR comment.
+name: Strix Halo correctness
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+    paths: [
+      '.github/workflows/strix-halo-correctness.yml',
+      'ci/strix-halo/**',
+      '**/CMakeLists.txt',
+      '**/*.cmake',
+      'ggml/**',
+      'src/**',
+      'include/**',
+      'common/**',
+      'tools/perplexity/**'
+    ]
+  push:
+    branches:
+      - master
+    paths: [
+      '.github/workflows/strix-halo-correctness.yml',
+      'ci/strix-halo/**',
+      '**/CMakeLists.txt',
+      '**/*.cmake',
+      'ggml/**',
+      'src/**',
+      'include/**',
+      'common/**',
+      'tools/perplexity/**'
+    ]
+  workflow_dispatch:
+    inputs:
+      target:
+        description: 'What to test: master, pr/<number>, a branch or a commit of this repository'
+        required: true
+        default: 'master'
+      comment:
+        description: 'Post the result as a PR comment (pr/<number> only)'
+        type: boolean
+        default: true
+
+# a new push to the same PR cancels its previous run; different PRs queue on the single runner
+concurrency:
+  group: strix-halo-correctness-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  correctness:
+    runs-on: [stx-halo, Linux, gfx1151]
+    timeout-minutes: 180
+
+    steps:
+      - name: Clone
+        uses: actions/checkout@v6
+
+      - name: Correctness vs upstream
+        env:
+          TARGET: ${{ github.event_name == 'pull_request' && format('pr/{0}', github.event.pull_request.number) || github.event_name == 'push' && github.sha || inputs.target }}
+          NO_COMMENT: ${{ github.event_name == 'workflow_dispatch' && !inputs.comment && '1' || '' }}
+          GH_TOKEN: ${{ github.token }}
+          ENGINE: podman
+        run: ci/strix-halo/strix-correctness "$TARGET"
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: strix-halo-correctness
+          path: ~/correctness-run/results/latest/
+          if-no-files-found: ignore
+          retention-days: 30
