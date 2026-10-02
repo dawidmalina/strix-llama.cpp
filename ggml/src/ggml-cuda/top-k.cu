@@ -469,8 +469,16 @@ void ggml_cuda_op_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     // gfx1151 measurements (2026-09-14) favor radix by 1.2-5.1x above these cutoffs.
     // Recheck the cutoffs when hipCUB changes; smaller batches favor its sort path.
     const bool use_radix = ncols >= 8192 || (ncols >= 4096 && nrows >= 128) || (ncols >= 2048 && nrows >= 512);
-    if (GGML_CUDA_CC_IS_RDNA3_5(ggml_cuda_info().devices[ctx.device].cc) && use_radix &&
-            ncols <= INT_MAX && nrows > 1 && nrows <= INT_MAX && k <= INT_MAX) {
+    bool capturing = false;
+#ifdef USE_CUDA_GRAPH
+    // hipCUB DeviceSegmentedRadixSort aborts during graph capture on gfx1151 ("operation not permitted when stream is capturing", HIP 7.15.26333, 2026-10-02). Remove when hipCUB supports capture.
+    cudaStreamCaptureStatus capture_status;
+    CUDA_CHECK(cudaStreamIsCapturing(stream, &capture_status));
+    capturing = capture_status != cudaStreamCaptureStatusNone;
+#endif // USE_CUDA_GRAPH
+    if (GGML_CUDA_CC_IS_RDNA3_5(ggml_cuda_info().devices[ctx.device].cc) &&
+            ((use_radix && nrows > 1) || (capturing && ncols > 1024)) &&
+            ncols <= INT_MAX && nrows <= INT_MAX && k <= INT_MAX) {
         // GGML_CUDA_TOPK_WG=0 keeps the multi-pass radix kernels (same selected set)
         static const bool wg = getenv("GGML_CUDA_TOPK_WG") == nullptr || atoi(getenv("GGML_CUDA_TOPK_WG")) != 0;
         if (wg && k <= ncols && nrows <= INT_MAX) {
